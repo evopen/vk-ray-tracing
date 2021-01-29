@@ -12,8 +12,8 @@ use bytemuck::{Pod, Zeroable};
 use anyhow::{Context, Result};
 
 use ash::{
-    extensions::khr::RayTracing,
     extensions::khr::Surface,
+    extensions::nv::RayTracing,
     version::{DeviceV1_0, DeviceV1_2, EntryV1_0, InstanceV1_0},
 };
 use ash::{
@@ -23,7 +23,7 @@ use ash::{
 use bytemuck::cast_slice;
 use gpu_allocator::{AllocationCreateDesc, VulkanAllocator};
 use log::info;
-use vk::AccelerationStructureInfoNV;
+use vk::{AccelerationStructureInfoNV, AccelerationStructureNV};
 
 const VERTICES: [f32; 9] = [0.25, 0.25, 0.0, 0.75, 0.25, 0.0, 0.50, 0.75, 0.0];
 const INDICES: [u32; 3] = [0, 1, 2];
@@ -70,6 +70,7 @@ pub struct Engine {
     vertices_buffer: vk::Buffer,
     transform_buffer: vk::Buffer,
     ray_tracing: RayTracing,
+    bottom_as: vk::AccelerationStructureNV,
 }
 
 impl Engine {
@@ -168,12 +169,9 @@ impl Engine {
             let queue_family_index = queue_family_index as u32;
             let device_extension_names_raw = [
                 Swapchain::name().as_ptr(),
-                CStr::from_bytes_with_nul(b"VK_KHR_acceleration_structure\0")
-                    .unwrap()
-                    .as_ptr(),
-                CStr::from_bytes_with_nul(b"VK_KHR_deferred_host_operations\0")
-                    .unwrap()
-                    .as_ptr(),
+                RayTracing::name().as_ptr(),
+                CStr::from_bytes_with_nul(b"VK_KHR_acceleration_structure\0")?.as_ptr(),
+                CStr::from_bytes_with_nul(b"VK_KHR_deferred_host_operations\0")?.as_ptr(),
             ];
 
             let features = vk::PhysicalDeviceFeatures {
@@ -370,6 +368,14 @@ impl Engine {
 
             let ray_tracing = RayTracing::new(&instance, &device);
 
+            let as_buffer = device.create_buffer(
+                &vk::BufferCreateInfo::builder()
+                    .size(std::mem::size_of_val(&transform_matrix) as u64)
+                    .usage(vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS)
+                    .build(),
+                None,
+            )?;
+
             Ok(Self {
                 size,
                 entry,
@@ -379,6 +385,7 @@ impl Engine {
                 vertices_buffer,
                 transform_buffer,
                 ray_tracing,
+                bottom_as: vk::AccelerationStructureNV::null(),
             })
         }
     }
@@ -402,14 +409,34 @@ impl Engine {
                     .build(),
             })
             .build();
-        println!("here");
+
         unsafe {
-            self.ray_tracing.create_acceleration_structure(
-                &vk::AccelerationStructureCreateInfoKHR::builder().build(),
+            self.bottom_as = self.ray_tracing.create_acceleration_structure(
+                &vk::AccelerationStructureCreateInfoNV::builder().build(),
                 None,
             )?;
+
+            let requirements = self
+                .ray_tracing
+                .get_acceleration_structure_memory_requirements(
+                    &vk::AccelerationStructureMemoryRequirementsInfoNV::builder()
+                        .acceleration_structure(self.bottom_as)
+                        .build(),
+                );
+            let memory = self.device.allocate_memory(
+                &vk::MemoryAllocateInfo::builder()
+                    .allocation_size(requirements.memory_requirements.size)
+                    .memory_type_index(0)
+                    .build(),
+                None,
+            )?;
+            self.ray_tracing.bind_acceleration_structure_memory(&[
+                vk::BindAccelerationStructureMemoryInfoNV::builder()
+                    .acceleration_structure(self.bottom_as)
+                    .memory(memory)
+                    .build(),
+            ]);
         }
-        println!("here");
 
         Ok(())
     }
