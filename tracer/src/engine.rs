@@ -11,19 +11,23 @@ use bytemuck::{Pod, Zeroable};
 
 use anyhow::{Context, Result};
 
+use ash::version::InstanceV1_1;
 use ash::{
+    extensions::khr::AccelerationStructure,
+    extensions::khr::DeferredHostOperations,
+    extensions::khr::RayTracingPipeline,
     extensions::khr::Surface,
-    extensions::nv::RayTracing,
-    version::{DeviceV1_0, DeviceV1_2, EntryV1_0, InstanceV1_0},
+    extensions::khr::TimelineSemaphore,
+    version::{DeviceV1_0, DeviceV1_2, EntryV1_0, InstanceV1_0, InstanceV1_2},
 };
 use ash::{
     extensions::{ext::DebugUtils, khr::Swapchain},
     vk, Device, Entry, Instance,
 };
 use bytemuck::cast_slice;
-use gpu_allocator::{AllocationCreateDesc, VulkanAllocator};
 use log::info;
-use vk::{AccelerationStructureInfoNV, AccelerationStructureNV};
+use vk::{AccelerationStructureInfoNV, AccelerationStructureNV, Handle};
+use vk_mem::{AllocatorCreateFlags, MemoryUsage};
 
 const VERTICES: [f32; 9] = [0.25, 0.25, 0.0, 0.75, 0.25, 0.0, 0.50, 0.75, 0.0];
 const INDICES: [u32; 3] = [0, 1, 2];
@@ -64,13 +68,15 @@ unsafe extern "system" fn vulkan_debug_callback(
 pub struct Engine {
     size: winit::dpi::PhysicalSize<u32>,
     entry: Entry,
-    allocator: VulkanAllocator,
+    allocator: vk_mem::Allocator,
     device: Device,
     instance: Instance,
     vertices_buffer: vk::Buffer,
+    indices_buffer: vk::Buffer,
     transform_buffer: vk::Buffer,
-    ray_tracing: RayTracing,
-    bottom_as: vk::AccelerationStructureNV,
+    ray_tracing_pipeline: RayTracingPipeline,
+    acceleration_structure: AccelerationStructure,
+    bottom_as: vk::AccelerationStructureKHR,
 }
 
 impl Engine {
@@ -141,6 +147,8 @@ impl Engine {
             let (pdevice, queue_family_index) = pdevices
                 .iter()
                 .map(|pdevice| {
+                    let prop = instance.get_physical_device_properties(*pdevice);
+
                     instance
                         .get_physical_device_queue_family_properties(*pdevice)
                         .iter()
@@ -155,7 +163,9 @@ impl Engine {
                                             surface,
                                         )
                                         .unwrap();
-                            if supports_graphic_and_surface {
+                            if supports_graphic_and_surface
+                                && prop.device_type == vk::PhysicalDeviceType::DISCRETE_GPU
+                            {
                                 Some((*pdevice, index))
                             } else {
                                 None
@@ -166,12 +176,17 @@ impl Engine {
                 .filter_map(|v| v)
                 .next()
                 .expect("Couldn't find suitable device.");
+
             let queue_family_index = queue_family_index as u32;
             let device_extension_names_raw = [
                 Swapchain::name().as_ptr(),
-                RayTracing::name().as_ptr(),
-                CStr::from_bytes_with_nul(b"VK_KHR_acceleration_structure\0")?.as_ptr(),
-                CStr::from_bytes_with_nul(b"VK_KHR_deferred_host_operations\0")?.as_ptr(),
+                AccelerationStructure::name().as_ptr(),
+                RayTracingPipeline::name().as_ptr(),
+                DeferredHostOperations::name().as_ptr(),
+                CStr::from_bytes_with_nul(b"VK_KHR_buffer_device_address\0")?.as_ptr(),
+                CStr::from_bytes_with_nul(b"VK_EXT_descriptor_indexing\0")?.as_ptr(),
+                CStr::from_bytes_with_nul(b"VK_KHR_spirv_1_4\0")?.as_ptr(),
+                CStr::from_bytes_with_nul(b"VK_KHR_shader_float_controls\0")?.as_ptr(),
             ];
 
             let features = vk::PhysicalDeviceFeatures {
@@ -185,21 +200,27 @@ impl Engine {
                 .queue_priorities(&priorities)
                 .build()];
 
-            let mut enabled_buffer_device_addres_features =
+            let mut enabled_buffer_device_address_features =
                 vk::PhysicalDeviceBufferDeviceAddressFeatures::builder()
                     .buffer_device_address(true)
                     .build();
             let mut enabled_ray_tracing_pipeline_features =
-                vk::PhysicalDeviceRayTracingFeaturesKHR::builder()
-                    .ray_tracing(true)
+                vk::PhysicalDeviceRayTracingPipelineFeaturesKHR::builder()
+                    .ray_tracing_pipeline(true)
+                    .build();
+            let mut enabled_acceleration_structure_features =
+                vk::PhysicalDeviceAccelerationStructureFeaturesKHR::builder()
+                    .acceleration_structure(true)
                     .build();
 
             let device_create_info = vk::DeviceCreateInfo::builder()
                 .queue_create_infos(&queue_info)
                 .enabled_extension_names(&device_extension_names_raw)
                 .enabled_features(&features)
-                .push_next(&mut enabled_buffer_device_addres_features)
-                .push_next(&mut enabled_ray_tracing_pipeline_features);
+                .push_next(&mut enabled_buffer_device_address_features)
+                .push_next(&mut enabled_ray_tracing_pipeline_features)
+                .push_next(&mut enabled_acceleration_structure_features)
+                .build();
 
             let device: Device = instance
                 .create_device(pdevice, &device_create_info, None)
@@ -211,9 +232,8 @@ impl Engine {
                 .get_physical_device_surface_formats(pdevice, surface)
                 .unwrap()[0];
 
-            let surface_capabilities = surface_loader
-                .get_physical_device_surface_capabilities(pdevice, surface)
-                .unwrap();
+            let surface_capabilities =
+                surface_loader.get_physical_device_surface_capabilities(pdevice, surface)?;
             let mut desired_image_count = surface_capabilities.min_image_count + 1;
             if surface_capabilities.max_image_count > 0
                 && desired_image_count > surface_capabilities.max_image_count
@@ -235,9 +255,8 @@ impl Engine {
             } else {
                 surface_capabilities.current_transform
             };
-            let present_modes = surface_loader
-                .get_physical_device_surface_present_modes(pdevice, surface)
-                .unwrap();
+            let present_modes =
+                surface_loader.get_physical_device_surface_present_modes(pdevice, surface)?;
             let present_mode = present_modes
                 .iter()
                 .cloned()
@@ -259,24 +278,20 @@ impl Engine {
                 .clipped(true)
                 .image_array_layers(1);
 
-            let swapchain = swapchain_loader
-                .create_swapchain(&swapchain_create_info, None)
-                .unwrap();
+            let swapchain = swapchain_loader.create_swapchain(&swapchain_create_info, None)?;
 
             let pool_create_info = vk::CommandPoolCreateInfo::builder()
                 .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER)
                 .queue_family_index(queue_family_index);
 
-            let pool = device.create_command_pool(&pool_create_info, None).unwrap();
+            let pool = device.create_command_pool(&pool_create_info, None)?;
 
             let command_buffer_allocate_info = vk::CommandBufferAllocateInfo::builder()
                 .command_buffer_count(2)
                 .command_pool(pool)
                 .level(vk::CommandBufferLevel::PRIMARY);
 
-            let command_buffers = device
-                .allocate_command_buffers(&command_buffer_allocate_info)
-                .unwrap();
+            let command_buffers = device.allocate_command_buffers(&command_buffer_allocate_info)?;
             let setup_command_buffer = command_buffers[0];
             let draw_command_buffer = command_buffers[1];
 
@@ -306,14 +321,17 @@ impl Engine {
                 .collect();
             let device_memory_properties = instance.get_physical_device_memory_properties(pdevice);
 
-            let mut allocator = VulkanAllocator::new(&gpu_allocator::VulkanAllocatorCreateDesc {
-                instance: instance.clone(),
+            let ray_tracing_pipeline = RayTracingPipeline::new(&instance, &device);
+            let acceleration_structure = AccelerationStructure::new(&instance, &device);
+            let mut allocator = vk_mem::Allocator::new(&vk_mem::AllocatorCreateInfo {
+                physical_device: pdevice.clone(),
                 device: device.clone(),
-                physical_device: pdevice,
-                debug_settings: Default::default(),
-            });
+                instance: instance.clone(),
+                flags: vk_mem::AllocatorCreateFlags::from_bits_unchecked(0x0000_0020),
+                ..Default::default()
+            })?;
 
-            let vertices_buffer = device.create_buffer(
+            let (vertices_buffer, allocation, info) = allocator.create_buffer(
                 &vk::BufferCreateInfo::builder()
                     .size(std::mem::size_of_val(&VERTICES) as u64)
                     .usage(
@@ -321,59 +339,30 @@ impl Engine {
                             | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
                     )
                     .build(),
-                None,
+                &vk_mem::AllocationCreateInfo::default(),
             )?;
 
-            let requirements = device.get_buffer_memory_requirements(vertices_buffer);
-            let mut allocation = allocator.allocate(&AllocationCreateDesc {
-                name: "vertex",
-                requirements,
-                location: gpu_allocator::MemoryLocation::CpuToGpu,
-                linear: true,
-            })?;
-            device.bind_buffer_memory(vertices_buffer, allocation.memory(), allocation.offset())?;
+            let (indices_buffer, _, _) = allocator.create_buffer(
+                &vk::BufferCreateInfo::builder()
+                    .size(std::mem::size_of_val(&INDICES) as u64)
+                    .usage(
+                        vk::BufferUsageFlags::INDEX_BUFFER
+                            | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
+                    )
+                    .build(),
+                &vk_mem::AllocationCreateInfo::default(),
+            )?;
 
-            let raw = allocation.mapped_slice_mut().unwrap();
-            let bytes = bytemuck::cast_slice(&VERTICES);
+            let transform_matrix = glam::Mat4::identity();
 
-            std::ptr::copy_nonoverlapping(bytes.as_ptr(), raw.as_mut_ptr(), bytes.len());
-
-            let transform_matrix = vk::TransformMatrixKHR {
-                matrix: [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0],
-            };
-
-            let transform_buffer = device.create_buffer(
+            let (transform_buffer, _, _) = allocator.create_buffer(
                 &vk::BufferCreateInfo::builder()
                     .size(std::mem::size_of_val(&transform_matrix) as u64)
-                    .usage(vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS)
-                    .build(),
-                None,
-            )?;
-            let mut allocation = allocator.allocate(&AllocationCreateDesc {
-                name: "vertex",
-                requirements: device.get_buffer_memory_requirements(transform_buffer),
-                location: gpu_allocator::MemoryLocation::CpuToGpu,
-                linear: true,
-            })?;
-            device.bind_buffer_memory(
-                transform_buffer,
-                allocation.memory(),
-                allocation.offset(),
-            )?;
-            std::ptr::copy_nonoverlapping(
-                bytemuck::cast_slice(&transform_matrix.matrix).as_ptr(),
-                allocation.mapped_slice_mut().unwrap().as_mut_ptr(),
-                std::mem::size_of_val(&transform_matrix),
-            );
-
-            let ray_tracing = RayTracing::new(&instance, &device);
-
-            let as_buffer = device.create_buffer(
-                &vk::BufferCreateInfo::builder()
-                    .size(std::mem::size_of_val(&transform_matrix) as u64)
-                    .usage(vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS)
-                    .build(),
-                None,
+                    .usage(
+                        vk::BufferUsageFlags::VERTEX_BUFFER
+                            | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
+                    ),
+                &vk_mem::AllocationCreateInfo::default(),
             )?;
 
             Ok(Self {
@@ -383,62 +372,106 @@ impl Engine {
                 device,
                 instance,
                 vertices_buffer,
+                indices_buffer,
                 transform_buffer,
-                ray_tracing,
-                bottom_as: vk::AccelerationStructureNV::null(),
+                ray_tracing_pipeline,
+                acceleration_structure,
+                bottom_as: vk::AccelerationStructureKHR::null(),
             })
         }
     }
 
     pub fn init(&mut self) -> Result<()> {
         self.create_bottom_level_acceleration_structure()?;
+        self.create_ray_tracing_pipeline()?;
         Ok(())
     }
 
     fn create_bottom_level_acceleration_structure(&mut self) -> Result<()> {
         let vertex_buffer_device_address = vk::DeviceOrHostAddressConstKHR {
-            device_address: self.get_buffer_device_address(self.vertices_buffer.clone()),
+            device_address: self.get_buffer_device_address(self.vertices_buffer),
         };
-        let mut acceleration_structure_geometry = vk::AccelerationStructureGeometryKHR::builder()
-            .geometry_type(vk::GeometryTypeKHR::TRIANGLES)
-            .geometry(vk::AccelerationStructureGeometryDataKHR {
-                triangles: vk::AccelerationStructureGeometryTrianglesDataKHR::builder()
-                    .vertex_format(vk::Format::R32G32B32_SFLOAT)
-                    .vertex_data(vertex_buffer_device_address)
-                    .vertex_stride(12)
-                    .build(),
-            })
-            .build();
+        let index_buffer_device_address = vk::DeviceOrHostAddressConstKHR {
+            device_address: self.get_buffer_device_address(self.indices_buffer),
+        };
+        let transform_buffer_device_address = vk::DeviceOrHostAddressConstKHR {
+            device_address: self.get_buffer_device_address(self.transform_buffer),
+        };
 
         unsafe {
-            self.bottom_as = self.ray_tracing.create_acceleration_structure(
-                &vk::AccelerationStructureCreateInfoNV::builder().build(),
+            let geometry = vk::AccelerationStructureGeometryKHR::builder()
+                .geometry_type(vk::GeometryTypeKHR::TRIANGLES)
+                .geometry(vk::AccelerationStructureGeometryDataKHR {
+                    triangles: vk::AccelerationStructureGeometryTrianglesDataKHR::builder()
+                        .vertex_data(vertex_buffer_device_address)
+                        .index_data(index_buffer_device_address)
+                        .transform_data(transform_buffer_device_address)
+                        .max_vertex(3)
+                        .build(),
+                })
+                .build();
+            let as_build_size = self
+                .acceleration_structure
+                .get_acceleration_structure_build_sizes(
+                    self.device.handle(),
+                    vk::AccelerationStructureBuildTypeKHR::DEVICE,
+                    &vk::AccelerationStructureBuildGeometryInfoKHR::builder()
+                        .ty(vk::AccelerationStructureTypeKHR::BOTTOM_LEVEL)
+                        .geometries(&[geometry]),
+                    &[1],
+                );
+            let buffer = self.create_acceleration_structure_buffer(as_build_size)?;
+
+            let as_bottom = self.acceleration_structure.create_acceleration_structure(
+                &vk::AccelerationStructureCreateInfoKHR::builder()
+                    .buffer(buffer)
+                    .size(as_build_size.acceleration_structure_size)
+                    .ty(vk::AccelerationStructureTypeKHR::BOTTOM_LEVEL)
+                    .build(),
                 None,
             )?;
 
-            let requirements = self
-                .ray_tracing
-                .get_acceleration_structure_memory_requirements(
-                    &vk::AccelerationStructureMemoryRequirementsInfoNV::builder()
-                        .acceleration_structure(self.bottom_as)
-                        .build(),
-                );
-            let memory = self.device.allocate_memory(
-                &vk::MemoryAllocateInfo::builder()
-                    .allocation_size(requirements.memory_requirements.size)
-                    .memory_type_index(0)
-                    .build(),
-                None,
-            )?;
-            self.ray_tracing.bind_acceleration_structure_memory(&[
-                vk::BindAccelerationStructureMemoryInfoNV::builder()
-                    .acceleration_structure(self.bottom_as)
-                    .memory(memory)
-                    .build(),
-            ]);
+            info!("bottom level as created");
         }
 
         Ok(())
+    }
+
+    fn create_ray_tracing_pipeline(&mut self) -> Result<()> {
+        unsafe {
+            let pipeline_layout = self
+                .device
+                .create_pipeline_layout(&vk::PipelineLayoutCreateInfo::builder().build(), None)?;
+            self.ray_tracing_pipeline.create_ray_tracing_pipelines(
+                vk::DeferredOperationKHR::null(),
+                vk::PipelineCache::null(),
+                &[vk::RayTracingPipelineCreateInfoKHR::builder()
+                    .layout(pipeline_layout)
+                    .stages()
+                    .groups()
+                    .build()],
+                None,
+            )?;
+        }
+
+        Ok(())
+    }
+
+    fn create_acceleration_structure_buffer(
+        &self,
+        build_size_info: vk::AccelerationStructureBuildSizesInfoKHR,
+    ) -> Result<vk::Buffer> {
+        let (buffer, _, _) = self.allocator.create_buffer(
+            &vk::BufferCreateInfo::builder()
+                .size(build_size_info.acceleration_structure_size)
+                .usage(
+                    vk::BufferUsageFlags::ACCELERATION_STRUCTURE_STORAGE_KHR
+                        | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
+                )
+                .build(),
+            &vk_mem::AllocationCreateInfo::default(),
+        )?;
+        Ok(buffer)
     }
 
     fn get_buffer_device_address(&self, buffer: vk::Buffer) -> u64 {

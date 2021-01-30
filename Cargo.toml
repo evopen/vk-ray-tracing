@@ -2,3 +2,9 @@
 members = [
     "tracer"
 ]
+
+
+[patch.crates-io]
+ash = { git = "https://github.com/MaikKlein/ash", rev = "abc1f80d65974de0de16ba9e9abda985458a4d17" }
+ash-window = { git = "https://github.com/MaikKlein/ash", rev = "abc1f80d65974de0de16ba9e9abda985458a4d17" }
+vk-mem = { path = "../vk-mem-rs" }
