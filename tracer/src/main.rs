@@ -38,7 +38,7 @@ fn init_logger() -> Result<()> {
 }
 
 fn main() -> Result<()> {
-    init_logger()?;
+    init_logger().unwrap();
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_io()
@@ -52,10 +52,11 @@ fn main() -> Result<()> {
         .with_title("Box of Chocolates")
         .with_resizable(true)
         .with_transparent(false)
-        .build(&event_loop)?;
+        .build(&event_loop)
+        .unwrap();
 
-    let mut engine = Engine::new(&window)?;
-    engine.init()?;
+    let mut engine = Engine::new(&window).unwrap();
+    engine.init().unwrap();
 
     rt.block_on(async {
         event_loop.run(move |event, _, control_flow| {

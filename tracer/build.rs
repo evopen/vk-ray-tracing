@@ -28,7 +28,18 @@ impl ShaderData {
         };
 
         let src = read_to_string(src_path.clone())?;
-        let spv_path = src_path.with_extension(format!("{}.spv", extension));
+        let shader_name = src_path
+            .file_stem()
+            .context("File have no stem")?
+            .to_str()
+            .context("invalid str")?;
+        let spv_path = src_path
+            .parent()
+            .unwrap()
+            .join("spirv")
+            .join(shader_name)
+            .with_extension(format!("{}.spv", extension));
+        dbg!(&spv_path);
 
         Ok(Self {
             src,

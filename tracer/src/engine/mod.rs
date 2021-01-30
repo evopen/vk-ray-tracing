@@ -1,9 +1,15 @@
+mod shaders;
+use shaders::Shaders;
+
+use rust_embed::RustEmbed;
+
 use std::{
     borrow::Cow,
     collections::{BTreeMap, LinkedList},
     ffi::{CStr, CString},
     io::Write,
     mem::size_of_val,
+    path::Path,
     time::Duration,
 };
 
@@ -442,19 +448,34 @@ impl Engine {
             let pipeline_layout = self
                 .device
                 .create_pipeline_layout(&vk::PipelineLayoutCreateInfo::builder().build(), None)?;
+
+            let info = vk::PipelineShaderStageCreateInfo::builder()
+                .module(self.create_shader_module(Shaders::get("ray_gen.rgen.spv").unwrap())?)
+                .build();
+
             self.ray_tracing_pipeline.create_ray_tracing_pipelines(
                 vk::DeferredOperationKHR::null(),
                 vk::PipelineCache::null(),
                 &[vk::RayTracingPipelineCreateInfoKHR::builder()
                     .layout(pipeline_layout)
-                    .stages()
-                    .groups()
+                    .stages(&[info])
                     .build()],
                 None,
             )?;
         }
 
         Ok(())
+    }
+
+    fn create_shader_module<P>(&self, spv: P) -> Result<vk::ShaderModule>
+    where
+        P: AsRef<[u8]>,
+    {
+        let raw_bytes = spv.as_ref();
+        let mut info = vk::ShaderModuleCreateInfo::builder().build();
+        info.p_code = bytemuck::cast_slice(raw_bytes).as_ptr();
+        info.code_size = raw_bytes.len();
+        unsafe { Ok(self.device.create_shader_module(&info, None)?) }
     }
 
     fn create_acceleration_structure_buffer(
