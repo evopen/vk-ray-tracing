@@ -80,9 +80,15 @@ pub struct Engine {
     vertices_buffer: vk::Buffer,
     indices_buffer: vk::Buffer,
     transform_buffer: vk::Buffer,
-    ray_tracing_pipeline: RayTracingPipeline,
+    ray_tracing_ext: RayTracingPipeline,
+    ray_tracing_pipeline: vk::Pipeline,
     acceleration_structure: AccelerationStructure,
     bottom_as: vk::AccelerationStructureKHR,
+    command_pool: vk::CommandPool,
+    queue: vk::Queue,
+    ray_gen_sbt_buffer: vk::Buffer,
+    hit_sbt_buffer: vk::Buffer,
+    miss_sbt_buffer: vk::Buffer,
 }
 
 impl Engine {
@@ -232,7 +238,7 @@ impl Engine {
                 .create_device(pdevice, &device_create_info, None)
                 .unwrap();
 
-            let present_queue = device.get_device_queue(queue_family_index as u32, 0);
+            let queue = device.get_device_queue(queue_family_index as u32, 0);
 
             let surface_format = surface_loader
                 .get_physical_device_surface_formats(pdevice, surface)
@@ -290,11 +296,11 @@ impl Engine {
                 .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER)
                 .queue_family_index(queue_family_index);
 
-            let pool = device.create_command_pool(&pool_create_info, None)?;
+            let command_pool = device.create_command_pool(&pool_create_info, None)?;
 
             let command_buffer_allocate_info = vk::CommandBufferAllocateInfo::builder()
                 .command_buffer_count(2)
-                .command_pool(pool)
+                .command_pool(command_pool)
                 .level(vk::CommandBufferLevel::PRIMARY);
 
             let command_buffers = device.allocate_command_buffers(&command_buffer_allocate_info)?;
@@ -377,12 +383,18 @@ impl Engine {
                 allocator,
                 device,
                 instance,
+                command_pool,
                 vertices_buffer,
                 indices_buffer,
                 transform_buffer,
-                ray_tracing_pipeline,
+                queue,
+                ray_gen_sbt_buffer: vk::Buffer::null(),
+                hit_sbt_buffer: vk::Buffer::null(),
+                ray_tracing_ext: ray_tracing_pipeline,
                 acceleration_structure,
+                ray_tracing_pipeline: vk::Pipeline::null(),
                 bottom_as: vk::AccelerationStructureKHR::null(),
+                miss_sbt_buffer: vk::Buffer::null(),
             })
         }
     }
@@ -390,6 +402,7 @@ impl Engine {
     pub fn init(&mut self) -> Result<()> {
         self.create_bottom_level_acceleration_structure()?;
         self.create_ray_tracing_pipeline()?;
+        self.create_shader_binding_table()?;
         Ok(())
     }
 
@@ -445,23 +458,91 @@ impl Engine {
 
     fn create_ray_tracing_pipeline(&mut self) -> Result<()> {
         unsafe {
-            let pipeline_layout = self
-                .device
-                .create_pipeline_layout(&vk::PipelineLayoutCreateInfo::builder().build(), None)?;
-
-            let info = vk::PipelineShaderStageCreateInfo::builder()
-                .module(self.create_shader_module(Shaders::get("ray_gen.rgen.spv").unwrap())?)
-                .build();
-
-            self.ray_tracing_pipeline.create_ray_tracing_pipelines(
-                vk::DeferredOperationKHR::null(),
-                vk::PipelineCache::null(),
-                &[vk::RayTracingPipelineCreateInfoKHR::builder()
-                    .layout(pipeline_layout)
-                    .stages(&[info])
-                    .build()],
+            let bind_group_layout = self.device.create_descriptor_set_layout(
+                &vk::DescriptorSetLayoutCreateInfo::builder()
+                    .bindings(&[
+                        vk::DescriptorSetLayoutBinding::builder()
+                            .binding(0)
+                            .descriptor_count(1)
+                            .descriptor_type(vk::DescriptorType::ACCELERATION_STRUCTURE_KHR)
+                            .stage_flags(vk::ShaderStageFlags::RAYGEN_KHR)
+                            .build(),
+                        vk::DescriptorSetLayoutBinding::builder()
+                            .binding(1)
+                            .descriptor_count(1)
+                            .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
+                            .stage_flags(vk::ShaderStageFlags::RAYGEN_KHR)
+                            .build(),
+                    ])
+                    .build(),
                 None,
             )?;
+            let pipeline_layout = self.device.create_pipeline_layout(
+                &vk::PipelineLayoutCreateInfo::builder()
+                    .set_layouts(&[bind_group_layout])
+                    .build(),
+                None,
+            )?;
+
+            self.ray_tracing_pipeline = self
+                .ray_tracing_ext
+                .create_ray_tracing_pipelines(
+                    vk::DeferredOperationKHR::null(),
+                    vk::PipelineCache::null(),
+                    &[vk::RayTracingPipelineCreateInfoKHR::builder()
+                        .layout(pipeline_layout)
+                        .stages(&[
+                            vk::PipelineShaderStageCreateInfo::builder()
+                                .module(self.create_shader_module(
+                                    Shaders::get("ray_gen.rgen.spv").unwrap(),
+                                )?)
+                                .stage(vk::ShaderStageFlags::RAYGEN_KHR)
+                                .name(CStr::from_bytes_with_nul(b"main\0")?)
+                                .build(),
+                            vk::PipelineShaderStageCreateInfo::builder()
+                                .module(self.create_shader_module(
+                                    Shaders::get("closest_hit.rchit.spv").unwrap(),
+                                )?)
+                                .stage(vk::ShaderStageFlags::CLOSEST_HIT_KHR)
+                                .name(CStr::from_bytes_with_nul(b"main\0")?)
+                                .build(),
+                            vk::PipelineShaderStageCreateInfo::builder()
+                                .module(self.create_shader_module(
+                                    Shaders::get("miss.rmiss.spv").unwrap(),
+                                )?)
+                                .stage(vk::ShaderStageFlags::MISS_KHR)
+                                .name(CStr::from_bytes_with_nul(b"main\0")?)
+                                .build(),
+                        ])
+                        .groups(&[
+                            vk::RayTracingShaderGroupCreateInfoKHR::builder()
+                                .ty(vk::RayTracingShaderGroupTypeKHR::GENERAL)
+                                .general_shader(0)
+                                .any_hit_shader(vk::SHADER_UNUSED_KHR)
+                                .closest_hit_shader(vk::SHADER_UNUSED_KHR)
+                                .intersection_shader(vk::SHADER_UNUSED_KHR)
+                                .build(),
+                            vk::RayTracingShaderGroupCreateInfoKHR::builder()
+                                .ty(vk::RayTracingShaderGroupTypeKHR::TRIANGLES_HIT_GROUP)
+                                .general_shader(vk::SHADER_UNUSED_KHR)
+                                .any_hit_shader(vk::SHADER_UNUSED_KHR)
+                                .closest_hit_shader(1)
+                                .intersection_shader(vk::SHADER_UNUSED_KHR)
+                                .build(),
+                            vk::RayTracingShaderGroupCreateInfoKHR::builder()
+                                .ty(vk::RayTracingShaderGroupTypeKHR::GENERAL)
+                                .general_shader(2)
+                                .any_hit_shader(vk::SHADER_UNUSED_KHR)
+                                .closest_hit_shader(vk::SHADER_UNUSED_KHR)
+                                .intersection_shader(vk::SHADER_UNUSED_KHR)
+                                .build(),
+                        ])
+                        .build()],
+                    None,
+                )?
+                .first()
+                .unwrap()
+                .to_owned();
         }
 
         Ok(())
@@ -505,6 +586,29 @@ impl Engine {
         }
     }
 
+    fn create_shader_binding_table(&mut self) -> Result<()> {
+        unsafe {
+            self.ray_gen_sbt_buffer = self
+                .allocator
+                .create_buffer(
+                    &vk::BufferCreateInfo::builder()
+                        .usage(vk::BufferUsageFlags::SHADER_BINDING_TABLE_KHR)
+                        .size(32)
+                        .build(),
+                    &vk_mem::AllocationCreateInfo::default(),
+                )?
+                .0;
+            let handle = self.ray_tracing_ext.get_ray_tracing_shader_group_handles(
+                self.ray_tracing_pipeline,
+                0,
+                3,
+                3 * 32,
+            )?;
+            dbg!(&handle.len());
+            Ok(())
+        }
+    }
+
     pub fn input(&self, event: &winit::event::WindowEvent) {}
 
     pub fn update(&self) -> Result<()> {
@@ -512,6 +616,48 @@ impl Engine {
     }
 
     pub fn render(&self) -> Result<()> {
+        unsafe {
+            let command_buffer = self
+                .device
+                .allocate_command_buffers(
+                    &vk::CommandBufferAllocateInfo::builder()
+                        .command_buffer_count(1)
+                        .command_pool(self.command_pool)
+                        .build(),
+                )?
+                .first()
+                .unwrap()
+                .to_owned();
+
+            self.device.begin_command_buffer(
+                command_buffer,
+                &vk::CommandBufferBeginInfo::builder().build(),
+            );
+            self.device.cmd_bind_pipeline(
+                command_buffer,
+                vk::PipelineBindPoint::RAY_TRACING_KHR,
+                self.ray_tracing_pipeline,
+            );
+            self.ray_tracing_ext.cmd_trace_rays(
+                command_buffer,
+                &vk::StridedDeviceAddressRegionKHR::builder().build(),
+                &vk::StridedDeviceAddressRegionKHR::builder().build(),
+                &vk::StridedDeviceAddressRegionKHR::builder().build(),
+                &vk::StridedDeviceAddressRegionKHR::default(),
+                800,
+                600,
+                1,
+            );
+            self.device.end_command_buffer(command_buffer);
+
+            self.device.queue_submit(
+                self.queue,
+                &[vk::SubmitInfo::builder().build()],
+                vk::Fence::null(),
+            )?;
+
+            info!("frame");
+        }
         Ok(())
     }
 }
