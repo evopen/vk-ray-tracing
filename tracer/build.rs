@@ -22,6 +22,8 @@ impl ShaderData {
             "frag" => shaderc::ShaderKind::Fragment,
             "comp" => shaderc::ShaderKind::Compute,
             "rgen" => shaderc::ShaderKind::RayGeneration,
+            "rchit" => shaderc::ShaderKind::ClosestHit,
+            "rmiss" => shaderc::ShaderKind::Miss,
             _ => bail!("Unsupported shader: {}", src_path.display()),
         };
 
@@ -44,6 +46,8 @@ fn main() -> Result<()> {
         glob("./src/**/*.frag")?,
         glob("./src/**/*.comp")?,
         glob("./src/**/*.rgen")?,
+        glob("./src/**/*.rchit")?,
+        glob("./src/**/*.rmiss")?,
     ];
 
     // This could be parallelized
@@ -56,6 +60,13 @@ fn main() -> Result<()> {
         .collect::<Result<Vec<_>>>()?;
 
     let mut compiler = shaderc::Compiler::new().context("Unable to create shader compiler")?;
+
+    let mut options = shaderc::CompileOptions::new().unwrap();
+    options.set_target_env(
+        shaderc::TargetEnv::Vulkan,
+        shaderc::EnvVersion::Vulkan1_2 as u32,
+    );
+    options.set_target_spirv(shaderc::SpirvVersion::V1_5);
 
     // This can't be parallelized. The [shaderc::Compiler] is not
     // thread safe. Also, it creates a lot of resources. You could
@@ -74,7 +85,7 @@ fn main() -> Result<()> {
             shader.kind,
             &shader.src_path.to_str().unwrap(),
             "main",
-            None,
+            Some(&options),
         )?;
         write(shader.spv_path, compiled.as_binary_u8())?;
     }
