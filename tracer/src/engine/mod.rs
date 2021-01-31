@@ -20,24 +20,27 @@ use bytemuck::{Pod, Zeroable};
 use anyhow::{Context, Result};
 
 use ash::{
+    extensions::ext::DebugUtils,
     extensions::khr::AccelerationStructure,
     extensions::khr::DeferredHostOperations,
     extensions::khr::RayTracingPipeline,
     extensions::khr::Surface,
+    extensions::khr::Swapchain,
     extensions::khr::TimelineSemaphore,
     version::{DeviceV1_0, DeviceV1_2, EntryV1_0, InstanceV1_0, InstanceV1_2},
 };
-use ash::{
-    extensions::{ext::DebugUtils, khr::Swapchain},
-    vk, Device, Entry, Instance,
-};
+use ash::{vk, Device, Entry, Instance};
 use bytemuck::cast_slice;
-use log::info;
-use vk::{AccelerationStructureInfoNV, AccelerationStructureNV, Handle};
+use log::{debug, info};
+use vk::{
+    AccelerationStructureInfoNV, AccelerationStructureNV, Handle, SwapchainKHR,
+    WriteDescriptorSetAccelerationStructureKHR,
+};
 use vk_mem::{AllocatorCreateFlags, MemoryUsage};
 
 const VERTICES: [f32; 9] = [0.25, 0.25, 0.0, 0.75, 0.25, 0.0, 0.50, 0.75, 0.0];
 const INDICES: [u32; 3] = [0, 1, 2];
+const TRANSFORM: [f32; 12] = [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0];
 
 unsafe extern "system" fn vulkan_debug_callback(
     message_severity: vk::DebugUtilsMessageSeverityFlagsEXT,
@@ -59,6 +62,10 @@ unsafe extern "system" fn vulkan_debug_callback(
     } else {
         CStr::from_ptr(callback_data.p_message).to_string_lossy()
     };
+
+    if message_severity == vk::DebugUtilsMessageSeverityFlagsEXT::INFO {
+        return vk::FALSE;
+    }
 
     println!(
         "{:?}:\n{:?} [{} ({})] : {}\n",
@@ -95,18 +102,27 @@ pub struct Engine {
     vertices_buffer: vk::Buffer,
     indices_buffer: vk::Buffer,
     transform_buffer: vk::Buffer,
-    ray_tracing_ext: RayTracingPipeline,
+    ray_tracing_pipeline_loader: RayTracingPipeline,
     ray_tracing_pipeline: vk::Pipeline,
-    acceleration_structure: AccelerationStructure,
-    bottom_as: vk::AccelerationStructureKHR,
+    acceleration_structure_loader: AccelerationStructure,
+    bottom_as: Option<vk::AccelerationStructureKHR>,
+    top_as: Option<vk::AccelerationStructureKHR>,
     command_pool: vk::CommandPool,
     queue: vk::Queue,
     ray_gen_sbt_buffer: vk::Buffer,
     hit_sbt_buffer: vk::Buffer,
     miss_sbt_buffer: vk::Buffer,
     descriptor_pool: vk::DescriptorPool,
-    descriptor_set_layout: vk::DescriptorSetLayout,
+    descriptor_set_layout: Option<vk::DescriptorSetLayout>,
+    descriptor_set: Option<vk::DescriptorSet>,
     allocation_keeper: Vec<Allocation>,
+    pipeline_layout: Option<vk::PipelineLayout>,
+    top_as_buffer: Option<vk::Buffer>,
+    bottom_as_buffer: Option<vk::Buffer>,
+    swapchain_loader: Swapchain,
+    swapchain: vk::SwapchainKHR,
+    storage_image: Option<vk::Image>,
+    storage_image_view: Option<vk::ImageView>,
 }
 
 impl Engine {
@@ -439,32 +455,159 @@ impl Engine {
                 queue,
                 ray_gen_sbt_buffer: vk::Buffer::null(),
                 hit_sbt_buffer: vk::Buffer::null(),
-                ray_tracing_ext: ray_tracing_pipeline,
-                acceleration_structure,
+                ray_tracing_pipeline_loader: ray_tracing_pipeline,
+                acceleration_structure_loader: acceleration_structure,
                 ray_tracing_pipeline: vk::Pipeline::null(),
-                bottom_as: vk::AccelerationStructureKHR::null(),
                 miss_sbt_buffer: vk::Buffer::null(),
                 descriptor_pool,
-                descriptor_set_layout: Default::default(),
+                descriptor_set_layout: None,
+                descriptor_set: None,
                 allocation_keeper,
+                pipeline_layout: None,
+                top_as_buffer: None,
+                bottom_as_buffer: None,
+                swapchain_loader,
+                swapchain,
+                bottom_as: None,
+                top_as: None,
+                storage_image: None,
+                storage_image_view: None,
             })
         }
     }
 
     pub fn init(&mut self) -> Result<()> {
+        self.create_storage_image()?;
+        info!("storage image created");
+
         self.create_bottom_level_acceleration_structure()?;
+        info!("BLAS created");
+
+        self.create_top_level_acceleration_structure()?;
+        info!("TLAS created");
+
         self.create_ray_tracing_pipeline()?;
+        info!("ray tracing pipeline created");
+
+        self.create_descriptor_set()?;
+        info!("descriptor set created");
+
         self.create_shader_binding_table()?;
+        info!("binding table created");
+
+        Ok(())
+    }
+
+    fn create_storage_image(&mut self) -> Result<()> {
+        unsafe {
+            let (image, allocation, _) = self.allocator.create_image(
+                &vk::ImageCreateInfo::builder()
+                    .image_type(vk::ImageType::TYPE_2D)
+                    .format(vk::Format::B8G8R8A8_UNORM)
+                    .extent(
+                        vk::Extent3D::builder()
+                            .width(800)
+                            .height(600)
+                            .depth(1)
+                            .build(),
+                    )
+                    .mip_levels(1)
+                    .array_layers(1)
+                    .samples(vk::SampleCountFlags::TYPE_1)
+                    .tiling(vk::ImageTiling::OPTIMAL)
+                    .usage(vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::STORAGE)
+                    .initial_layout(vk::ImageLayout::UNDEFINED)
+                    .sharing_mode(vk::SharingMode::EXCLUSIVE)
+                    .build(),
+                &vk_mem::AllocationCreateInfo::default(),
+            )?;
+            self.allocation_keeper.push(Allocation {
+                object: VulkanObject::Image(image),
+                allocation,
+            });
+            self.storage_image_view = Some(
+                self.device.create_image_view(
+                    &vk::ImageViewCreateInfo::builder()
+                        .view_type(vk::ImageViewType::TYPE_2D)
+                        .format(vk::Format::B8G8R8A8_UNORM)
+                        .subresource_range(
+                            vk::ImageSubresourceRange::builder()
+                                .aspect_mask(vk::ImageAspectFlags::COLOR)
+                                .base_mip_level(0)
+                                .level_count(1)
+                                .base_array_layer(0)
+                                .layer_count(1)
+                                .build(),
+                        )
+                        .image(image)
+                        .build(),
+                    None,
+                )?,
+            );
+
+            self.storage_image = Some(image);
+        }
         Ok(())
     }
 
     fn create_descriptor_set(&mut self) -> Result<()> {
         unsafe {
-            self.device.allocate_descriptor_sets(
-                &vk::DescriptorSetAllocateInfo::builder()
-                    .descriptor_pool(self.descriptor_pool)
-                    .set_layouts(&[self.descriptor_set_layout]),
-            )?;
+            self.descriptor_set = Some(
+                self.device
+                    .allocate_descriptor_sets(
+                        &vk::DescriptorSetAllocateInfo::builder()
+                            .descriptor_pool(self.descriptor_pool)
+                            .set_layouts(&[self.descriptor_set_layout.unwrap()]),
+                    )?
+                    .first()
+                    .unwrap()
+                    .to_owned(),
+            );
+            debug!("descriptor set allocated");
+            let mut as_descirptor_write = vk::WriteDescriptorSet::builder()
+                .descriptor_type(vk::DescriptorType::ACCELERATION_STRUCTURE_KHR)
+                .dst_binding(0)
+                .dst_set(self.descriptor_set.unwrap())
+                .push_next(
+                    &mut vk::WriteDescriptorSetAccelerationStructureKHR::builder()
+                        .acceleration_structures(&[self.top_as.unwrap()])
+                        .build(),
+                )
+                .build();
+            as_descirptor_write.descriptor_count = 1;
+            self.device.update_descriptor_sets(
+                &[
+                    std::iter::once(
+                        vk::WriteDescriptorSet::builder()
+                            .descriptor_type(vk::DescriptorType::ACCELERATION_STRUCTURE_KHR)
+                            .dst_binding(0)
+                            .dst_set(self.descriptor_set.unwrap())
+                            .push_next(
+                                &mut vk::WriteDescriptorSetAccelerationStructureKHR::builder()
+                                    .acceleration_structures(&[self.top_as.unwrap()])
+                                    .build(),
+                            )
+                            .build(),
+                    )
+                    .map(|mut a| {
+                        a.descriptor_count = 1;
+                        a
+                    })
+                    .next()
+                    .unwrap(),
+                    vk::WriteDescriptorSet::builder()
+                        .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
+                        .dst_binding(1)
+                        .dst_set(self.descriptor_set.unwrap())
+                        .image_info(&[vk::DescriptorImageInfo::builder()
+                            .image_view(self.storage_image_view.unwrap())
+                            .image_layout(vk::ImageLayout::GENERAL)
+                            .build()])
+                        .build(),
+                ],
+                &[],
+            );
+            debug!("descriptor set wrote");
         }
         Ok(())
     }
@@ -493,7 +636,7 @@ impl Engine {
                 })
                 .build();
             let as_build_size = self
-                .acceleration_structure
+                .acceleration_structure_loader
                 .get_acceleration_structure_build_sizes(
                     self.device.handle(),
                     vk::AccelerationStructureBuildTypeKHR::DEVICE,
@@ -504,18 +647,87 @@ impl Engine {
                 );
             let buffer = self.create_acceleration_structure_buffer(as_build_size)?;
 
-            let as_bottom = self.acceleration_structure.create_acceleration_structure(
-                &vk::AccelerationStructureCreateInfoKHR::builder()
-                    .buffer(buffer)
-                    .size(as_build_size.acceleration_structure_size)
-                    .ty(vk::AccelerationStructureTypeKHR::BOTTOM_LEVEL)
-                    .build(),
-                None,
-            )?;
-
-            info!("bottom level as created");
+            let bottom_as = self
+                .acceleration_structure_loader
+                .create_acceleration_structure(
+                    &vk::AccelerationStructureCreateInfoKHR::builder()
+                        .buffer(buffer)
+                        .size(as_build_size.acceleration_structure_size)
+                        .ty(vk::AccelerationStructureTypeKHR::BOTTOM_LEVEL)
+                        .build(),
+                    None,
+                )?;
+            self.bottom_as_buffer = Some(buffer);
+            self.bottom_as = Some(bottom_as);
         }
 
+        Ok(())
+    }
+
+    fn create_top_level_acceleration_structure(&mut self) -> Result<()> {
+        unsafe {
+            let instance = vk::AccelerationStructureInstanceKHR {
+                transform: vk::TransformMatrixKHR { matrix: TRANSFORM },
+                instance_custom_index_and_mask: 0xFF,
+                instance_shader_binding_table_record_offset_and_flags: 0,
+                acceleration_structure_reference: vk::AccelerationStructureReferenceKHR {
+                    device_handle: self
+                        .acceleration_structure_loader
+                        .get_acceleration_structure_device_address(
+                            self.device.handle(),
+                            &vk::AccelerationStructureDeviceAddressInfoKHR::builder()
+                                .acceleration_structure(self.bottom_as.unwrap())
+                                .build(),
+                        ),
+                },
+            };
+            let (instance_buffer, allocation, _) = self.allocator.create_buffer(
+                &vk::BufferCreateInfo::builder()
+                    .usage(vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS | vk::BufferUsageFlags::ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_KHR)
+                    .size(std::mem::size_of_val(&instance) as u64)
+                    .build(),
+                &vk_mem::AllocationCreateInfo::default(),
+            )?;
+            self.allocation_keeper.push(Allocation {
+                object: VulkanObject::Buffer(instance_buffer),
+                allocation,
+            });
+            let geometry = vk::AccelerationStructureGeometryKHR::builder()
+                .geometry_type(vk::GeometryTypeKHR::INSTANCES)
+                .geometry(vk::AccelerationStructureGeometryDataKHR {
+                    instances: vk::AccelerationStructureGeometryInstancesDataKHR::builder()
+                        .array_of_pointers(false)
+                        .data(vk::DeviceOrHostAddressConstKHR {
+                            device_address: self.get_buffer_device_address(instance_buffer),
+                        })
+                        .build(),
+                })
+                .build();
+            let as_build_size = self
+                .acceleration_structure_loader
+                .get_acceleration_structure_build_sizes(
+                    self.device.handle(),
+                    vk::AccelerationStructureBuildTypeKHR::DEVICE,
+                    &vk::AccelerationStructureBuildGeometryInfoKHR::builder()
+                        .ty(vk::AccelerationStructureTypeKHR::TOP_LEVEL)
+                        .geometries(&[geometry]),
+                    &[1],
+                );
+            let buffer = self.create_acceleration_structure_buffer(as_build_size)?;
+
+            let top_as = self
+                .acceleration_structure_loader
+                .create_acceleration_structure(
+                    &vk::AccelerationStructureCreateInfoKHR::builder()
+                        .buffer(buffer)
+                        .size(as_build_size.acceleration_structure_size)
+                        .ty(vk::AccelerationStructureTypeKHR::TOP_LEVEL)
+                        .build(),
+                    None,
+                )?;
+            self.top_as = Some(top_as);
+            self.top_as_buffer = Some(buffer);
+        }
         Ok(())
     }
 
@@ -540,20 +752,23 @@ impl Engine {
                     .build(),
                 None,
             )?;
-            let pipeline_layout = self.device.create_pipeline_layout(
-                &vk::PipelineLayoutCreateInfo::builder()
-                    .set_layouts(&[descriptor_set_layout])
-                    .build(),
-                None,
-            )?;
+            self.descriptor_set_layout = Some(descriptor_set_layout);
+            self.pipeline_layout = Some(
+                self.device.create_pipeline_layout(
+                    &vk::PipelineLayoutCreateInfo::builder()
+                        .set_layouts(&[descriptor_set_layout])
+                        .build(),
+                    None,
+                )?,
+            );
 
             self.ray_tracing_pipeline = self
-                .ray_tracing_ext
+                .ray_tracing_pipeline_loader
                 .create_ray_tracing_pipelines(
                     vk::DeferredOperationKHR::null(),
                     vk::PipelineCache::null(),
                     &[vk::RayTracingPipelineCreateInfoKHR::builder()
-                        .layout(pipeline_layout)
+                        .layout(self.pipeline_layout.unwrap())
                         .stages(&[
                             vk::PipelineShaderStageCreateInfo::builder()
                                 .module(self.create_shader_module(
@@ -667,12 +882,9 @@ impl Engine {
                 object: VulkanObject::Buffer(buffer),
                 allocation,
             });
-            let handle = self.ray_tracing_ext.get_ray_tracing_shader_group_handles(
-                self.ray_tracing_pipeline,
-                0,
-                3,
-                3 * 32,
-            )?;
+            let handle = self
+                .ray_tracing_pipeline_loader
+                .get_ray_tracing_shader_group_handles(self.ray_tracing_pipeline, 0, 3, 3 * 32)?;
             Ok(())
         }
     }
@@ -696,6 +908,7 @@ impl Engine {
                 .first()
                 .unwrap()
                 .to_owned();
+            let swapchain_images = self.swapchain_loader.get_swapchain_images(self.swapchain)?;
 
             self.device.begin_command_buffer(
                 command_buffer,
@@ -706,7 +919,15 @@ impl Engine {
                 vk::PipelineBindPoint::RAY_TRACING_KHR,
                 self.ray_tracing_pipeline,
             );
-            self.ray_tracing_ext.cmd_trace_rays(
+            self.device.cmd_bind_descriptor_sets(
+                command_buffer,
+                vk::PipelineBindPoint::RAY_TRACING_KHR,
+                self.pipeline_layout.unwrap(),
+                0,
+                &[self.descriptor_set.unwrap()],
+                &[],
+            );
+            self.ray_tracing_pipeline_loader.cmd_trace_rays(
                 command_buffer,
                 &vk::StridedDeviceAddressRegionKHR::builder().build(),
                 &vk::StridedDeviceAddressRegionKHR::builder().build(),
