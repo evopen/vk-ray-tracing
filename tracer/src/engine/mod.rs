@@ -1,10 +1,12 @@
 mod shaders;
+
 use shaders::Shaders;
 
 use rust_embed::RustEmbed;
 
 use std::{
     borrow::Cow,
+    collections::BTreeSet,
     collections::{BTreeMap, LinkedList},
     ffi::{CStr, CString},
     io::Write,
@@ -17,7 +19,6 @@ use bytemuck::{Pod, Zeroable};
 
 use anyhow::{Context, Result};
 
-use ash::version::InstanceV1_1;
 use ash::{
     extensions::khr::AccelerationStructure,
     extensions::khr::DeferredHostOperations,
@@ -68,7 +69,21 @@ unsafe extern "system" fn vulkan_debug_callback(
         message,
     );
 
+    if message_severity == vk::DebugUtilsMessageSeverityFlagsEXT::ERROR {
+        panic!("deal with vulkan validation error, exiting");
+    }
+
     vk::FALSE
+}
+
+enum VulkanObject {
+    Buffer(vk::Buffer),
+    Image(vk::Image),
+}
+
+struct Allocation {
+    object: VulkanObject,
+    allocation: vk_mem::Allocation,
 }
 
 pub struct Engine {
@@ -89,6 +104,9 @@ pub struct Engine {
     ray_gen_sbt_buffer: vk::Buffer,
     hit_sbt_buffer: vk::Buffer,
     miss_sbt_buffer: vk::Buffer,
+    descriptor_pool: vk::DescriptorPool,
+    descriptor_set_layout: vk::DescriptorSetLayout,
+    allocation_keeper: Vec<Allocation>,
 }
 
 impl Engine {
@@ -342,6 +360,23 @@ impl Engine {
                 flags: vk_mem::AllocatorCreateFlags::from_bits_unchecked(0x0000_0020),
                 ..Default::default()
             })?;
+            let mut allocation_keeper = Vec::new();
+
+            let descriptor_pool = device.create_descriptor_pool(
+                &vk::DescriptorPoolCreateInfo::builder()
+                    .pool_sizes(&[
+                        vk::DescriptorPoolSize::builder()
+                            .ty(vk::DescriptorType::STORAGE_IMAGE)
+                            .descriptor_count(1)
+                            .build(),
+                        vk::DescriptorPoolSize::builder()
+                            .ty(vk::DescriptorType::ACCELERATION_STRUCTURE_KHR)
+                            .descriptor_count(1)
+                            .build(),
+                    ])
+                    .max_sets(1),
+                None,
+            )?;
 
             let (vertices_buffer, allocation, info) = allocator.create_buffer(
                 &vk::BufferCreateInfo::builder()
@@ -354,7 +389,12 @@ impl Engine {
                 &vk_mem::AllocationCreateInfo::default(),
             )?;
 
-            let (indices_buffer, _, _) = allocator.create_buffer(
+            allocation_keeper.push(Allocation {
+                object: VulkanObject::Buffer(vertices_buffer),
+                allocation,
+            });
+
+            let (indices_buffer, allocation, _) = allocator.create_buffer(
                 &vk::BufferCreateInfo::builder()
                     .size(std::mem::size_of_val(&INDICES) as u64)
                     .usage(
@@ -365,9 +405,14 @@ impl Engine {
                 &vk_mem::AllocationCreateInfo::default(),
             )?;
 
+            allocation_keeper.push(Allocation {
+                object: VulkanObject::Buffer(indices_buffer),
+                allocation,
+            });
+
             let transform_matrix = glam::Mat4::identity();
 
-            let (transform_buffer, _, _) = allocator.create_buffer(
+            let (transform_buffer, allocation, _) = allocator.create_buffer(
                 &vk::BufferCreateInfo::builder()
                     .size(std::mem::size_of_val(&transform_matrix) as u64)
                     .usage(
@@ -376,6 +421,10 @@ impl Engine {
                     ),
                 &vk_mem::AllocationCreateInfo::default(),
             )?;
+            allocation_keeper.push(Allocation {
+                object: VulkanObject::Buffer(transform_buffer),
+                allocation,
+            });
 
             Ok(Self {
                 size,
@@ -395,6 +444,9 @@ impl Engine {
                 ray_tracing_pipeline: vk::Pipeline::null(),
                 bottom_as: vk::AccelerationStructureKHR::null(),
                 miss_sbt_buffer: vk::Buffer::null(),
+                descriptor_pool,
+                descriptor_set_layout: Default::default(),
+                allocation_keeper,
             })
         }
     }
@@ -403,6 +455,17 @@ impl Engine {
         self.create_bottom_level_acceleration_structure()?;
         self.create_ray_tracing_pipeline()?;
         self.create_shader_binding_table()?;
+        Ok(())
+    }
+
+    fn create_descriptor_set(&mut self) -> Result<()> {
+        unsafe {
+            self.device.allocate_descriptor_sets(
+                &vk::DescriptorSetAllocateInfo::builder()
+                    .descriptor_pool(self.descriptor_pool)
+                    .set_layouts(&[self.descriptor_set_layout]),
+            )?;
+        }
         Ok(())
     }
 
@@ -458,7 +521,7 @@ impl Engine {
 
     fn create_ray_tracing_pipeline(&mut self) -> Result<()> {
         unsafe {
-            let bind_group_layout = self.device.create_descriptor_set_layout(
+            let descriptor_set_layout = self.device.create_descriptor_set_layout(
                 &vk::DescriptorSetLayoutCreateInfo::builder()
                     .bindings(&[
                         vk::DescriptorSetLayoutBinding::builder()
@@ -479,7 +542,7 @@ impl Engine {
             )?;
             let pipeline_layout = self.device.create_pipeline_layout(
                 &vk::PipelineLayoutCreateInfo::builder()
-                    .set_layouts(&[bind_group_layout])
+                    .set_layouts(&[descriptor_set_layout])
                     .build(),
                 None,
             )?;
@@ -560,10 +623,10 @@ impl Engine {
     }
 
     fn create_acceleration_structure_buffer(
-        &self,
+        &mut self,
         build_size_info: vk::AccelerationStructureBuildSizesInfoKHR,
     ) -> Result<vk::Buffer> {
-        let (buffer, _, _) = self.allocator.create_buffer(
+        let (buffer, allocation, _) = self.allocator.create_buffer(
             &vk::BufferCreateInfo::builder()
                 .size(build_size_info.acceleration_structure_size)
                 .usage(
@@ -573,6 +636,10 @@ impl Engine {
                 .build(),
             &vk_mem::AllocationCreateInfo::default(),
         )?;
+        self.allocation_keeper.push(Allocation {
+            object: VulkanObject::Buffer(buffer),
+            allocation,
+        });
         Ok(buffer)
     }
 
@@ -588,23 +655,24 @@ impl Engine {
 
     fn create_shader_binding_table(&mut self) -> Result<()> {
         unsafe {
-            self.ray_gen_sbt_buffer = self
-                .allocator
-                .create_buffer(
-                    &vk::BufferCreateInfo::builder()
-                        .usage(vk::BufferUsageFlags::SHADER_BINDING_TABLE_KHR)
-                        .size(32)
-                        .build(),
-                    &vk_mem::AllocationCreateInfo::default(),
-                )?
-                .0;
+            let (buffer, allocation, _) = self.allocator.create_buffer(
+                &vk::BufferCreateInfo::builder()
+                    .usage(vk::BufferUsageFlags::SHADER_BINDING_TABLE_KHR)
+                    .size(32)
+                    .build(),
+                &vk_mem::AllocationCreateInfo::default(),
+            )?;
+            self.ray_gen_sbt_buffer = buffer;
+            self.allocation_keeper.push(Allocation {
+                object: VulkanObject::Buffer(buffer),
+                allocation,
+            });
             let handle = self.ray_tracing_ext.get_ray_tracing_shader_group_handles(
                 self.ray_tracing_pipeline,
                 0,
                 3,
                 3 * 32,
             )?;
-            dbg!(&handle.len());
             Ok(())
         }
     }
@@ -659,5 +727,20 @@ impl Engine {
             info!("frame");
         }
         Ok(())
+    }
+}
+
+impl Drop for Engine {
+    fn drop(&mut self) {
+        self.allocation_keeper
+            .iter()
+            .for_each(|allocation| match allocation.object {
+                VulkanObject::Buffer(buffer) => self
+                    .allocator
+                    .destroy_buffer(buffer, &allocation.allocation),
+                VulkanObject::Image(image) => {
+                    self.allocator.destroy_image(image, &allocation.allocation)
+                }
+            });
     }
 }
