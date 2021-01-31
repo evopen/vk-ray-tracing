@@ -17,7 +17,7 @@ use std::{
 
 use bytemuck::{Pod, Zeroable};
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 
 use ash::{
     extensions::ext::DebugUtils,
@@ -123,6 +123,11 @@ pub struct Engine {
     swapchain: vk::SwapchainKHR,
     storage_image: Option<vk::Image>,
     storage_image_view: Option<vk::ImageView>,
+    image_layout_keeper: BTreeMap<vk::Image, vk::ImageLayout>,
+    present_images: Vec<vk::Image>,
+    render_finish_semaphore: vk::Semaphore,
+    render_finish_fence: vk::Fence,
+    image_available_semaphore: vk::Semaphore,
 }
 
 impl Engine {
@@ -308,15 +313,18 @@ impl Engine {
                 .cloned()
                 .find(|&mode| mode == vk::PresentModeKHR::MAILBOX)
                 .unwrap_or(vk::PresentModeKHR::FIFO);
+            let present_mode = vk::PresentModeKHR::FIFO;
             let swapchain_loader = Swapchain::new(&instance, &device);
 
             let swapchain_create_info = vk::SwapchainCreateInfoKHR::builder()
                 .surface(surface)
-                .min_image_count(desired_image_count)
+                .min_image_count(2)
                 .image_color_space(surface_format.color_space)
                 .image_format(surface_format.format)
                 .image_extent(surface_resolution)
-                .image_usage(vk::ImageUsageFlags::COLOR_ATTACHMENT)
+                .image_usage(
+                    vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::TRANSFER_DST,
+                )
                 .image_sharing_mode(vk::SharingMode::EXCLUSIVE)
                 .pre_transform(pre_transform)
                 .composite_alpha(vk::CompositeAlphaFlagsKHR::OPAQUE)
@@ -365,6 +373,10 @@ impl Engine {
                     device.create_image_view(&create_view_info, None).unwrap()
                 })
                 .collect();
+            let mut image_layout_keeper = BTreeMap::new();
+            present_images.iter().for_each(|image| {
+                image_layout_keeper.insert(*image, vk::ImageLayout::UNDEFINED);
+            });
             let device_memory_properties = instance.get_physical_device_memory_properties(pdevice);
 
             let ray_tracing_pipeline = RayTracingPipeline::new(&instance, &device);
@@ -442,6 +454,17 @@ impl Engine {
                 allocation,
             });
 
+            let render_finish_semaphore =
+                device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None)?;
+            let image_available_semaphore =
+                device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None)?;
+            let render_finish_fence = device.create_fence(
+                &vk::FenceCreateInfo::builder()
+                    .flags(vk::FenceCreateFlags::SIGNALED)
+                    .build(),
+                None,
+            )?;
+
             Ok(Self {
                 size,
                 entry,
@@ -472,6 +495,11 @@ impl Engine {
                 top_as: None,
                 storage_image: None,
                 storage_image_view: None,
+                image_layout_keeper,
+                present_images,
+                render_finish_semaphore,
+                image_available_semaphore,
+                render_finish_fence,
             })
         }
     }
@@ -521,6 +549,8 @@ impl Engine {
                     .build(),
                 &vk_mem::AllocationCreateInfo::default(),
             )?;
+            self.image_layout_keeper
+                .insert(image, vk::ImageLayout::UNDEFINED);
             self.allocation_keeper.push(Allocation {
                 object: VulkanObject::Image(image),
                 allocation,
@@ -544,6 +574,36 @@ impl Engine {
                     None,
                 )?,
             );
+
+            let fence = self
+                .device
+                .create_fence(&vk::FenceCreateInfo::default(), None)?;
+
+            let command_buffer = self
+                .device
+                .allocate_command_buffers(
+                    &vk::CommandBufferAllocateInfo::builder()
+                        .command_buffer_count(1)
+                        .command_pool(self.command_pool)
+                        .build(),
+                )?
+                .first()
+                .unwrap()
+                .to_owned();
+            self.device.begin_command_buffer(
+                command_buffer,
+                &vk::CommandBufferBeginInfo::builder().build(),
+            );
+            self.cmd_set_image_layout(command_buffer, image, vk::ImageLayout::GENERAL)?;
+            self.device.end_command_buffer(command_buffer);
+            self.device.queue_submit(
+                self.queue,
+                &[vk::SubmitInfo::builder()
+                    .command_buffers(&[command_buffer])
+                    .build()],
+                fence,
+            )?;
+            self.device.wait_for_fences(&[fence], true, std::u64::MAX)?;
 
             self.storage_image = Some(image);
         }
@@ -895,8 +955,15 @@ impl Engine {
         Ok(())
     }
 
-    pub fn render(&self) -> Result<()> {
+    pub fn render(&mut self) -> Result<()> {
         unsafe {
+            let (index, _) = self.swapchain_loader.acquire_next_image(
+                self.swapchain,
+                0,
+                self.image_available_semaphore,
+                vk::Fence::null(),
+            )?;
+
             let command_buffer = self
                 .device
                 .allocate_command_buffers(
@@ -908,12 +975,10 @@ impl Engine {
                 .first()
                 .unwrap()
                 .to_owned();
-            let swapchain_images = self.swapchain_loader.get_swapchain_images(self.swapchain)?;
 
-            self.device.begin_command_buffer(
-                command_buffer,
-                &vk::CommandBufferBeginInfo::builder().build(),
-            );
+            self.device
+                .begin_command_buffer(command_buffer, &vk::CommandBufferBeginInfo::default());
+
             self.device.cmd_bind_pipeline(
                 command_buffer,
                 vk::PipelineBindPoint::RAY_TRACING_KHR,
@@ -927,6 +992,7 @@ impl Engine {
                 &[self.descriptor_set.unwrap()],
                 &[],
             );
+
             self.ray_tracing_pipeline_loader.cmd_trace_rays(
                 command_buffer,
                 &vk::StridedDeviceAddressRegionKHR::builder().build(),
@@ -937,15 +1003,146 @@ impl Engine {
                 600,
                 1,
             );
-            self.device.end_command_buffer(command_buffer);
-
-            self.device.queue_submit(
-                self.queue,
-                &[vk::SubmitInfo::builder().build()],
-                vk::Fence::null(),
+            self.cmd_set_image_layout(
+                command_buffer,
+                self.storage_image.unwrap(),
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+            )?;
+            self.cmd_set_image_layout(
+                command_buffer,
+                self.present_images[index as usize],
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
             )?;
 
-            info!("frame");
+            self.device.cmd_copy_image(
+                command_buffer,
+                self.storage_image.unwrap(),
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                self.present_images[index as usize],
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                &[vk::ImageCopy::builder()
+                    .src_subresource(
+                        vk::ImageSubresourceLayers::builder()
+                            .layer_count(1)
+                            .base_array_layer(0)
+                            .aspect_mask(vk::ImageAspectFlags::COLOR)
+                            .mip_level(0)
+                            .build(),
+                    )
+                    .dst_subresource(
+                        vk::ImageSubresourceLayers::builder()
+                            .layer_count(1)
+                            .base_array_layer(0)
+                            .aspect_mask(vk::ImageAspectFlags::COLOR)
+                            .mip_level(0)
+                            .build(),
+                    )
+                    .extent(vk::Extent3D {
+                        width: 800,
+                        height: 600,
+                        depth: 1,
+                    })
+                    .build()],
+            );
+            self.cmd_set_image_layout(
+                command_buffer,
+                self.present_images[index as usize],
+                vk::ImageLayout::PRESENT_SRC_KHR,
+            )?;
+            self.cmd_set_image_layout(
+                command_buffer,
+                self.storage_image.unwrap(),
+                vk::ImageLayout::GENERAL,
+            )?;
+            self.device.end_command_buffer(command_buffer);
+
+            debug!("record complete");
+            self.device
+                .wait_for_fences(&[self.render_finish_fence], true, std::u64::MAX)?;
+            self.device.reset_fences(&[self.render_finish_fence])?;
+            debug!("render finished");
+            self.device.queue_submit(
+                self.queue,
+                &[vk::SubmitInfo::builder()
+                    .command_buffers(&[command_buffer])
+                    .wait_semaphores(&[self.image_available_semaphore])
+                    .wait_dst_stage_mask(&[vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT])
+                    .signal_semaphores(&[self.render_finish_semaphore])
+                    .build()],
+                self.render_finish_fence,
+            )?;
+            debug!("command submitted");
+            self.swapchain_loader.queue_present(
+                self.queue,
+                &vk::PresentInfoKHR::builder()
+                    .swapchains(&[self.swapchain])
+                    .image_indices(&[index])
+                    .wait_semaphores(&[self.render_finish_semaphore])
+                    .build(),
+            );
+
+            info!("frame presented");
+        }
+        Ok(())
+    }
+
+    fn cmd_set_image_layout(
+        &mut self,
+        command_buffer: vk::CommandBuffer,
+        image: vk::Image,
+        new_layout: vk::ImageLayout,
+    ) -> Result<()> {
+        use vk::AccessFlags;
+        use vk::ImageLayout;
+        use vk::PipelineStageFlags;
+        unsafe {
+            let old_layout = *self.image_layout_keeper.get(&image).unwrap();
+
+            let src_access_mask = match old_layout {
+                ImageLayout::UNDEFINED => AccessFlags::default(),
+                ImageLayout::GENERAL => AccessFlags::default(),
+                ImageLayout::COLOR_ATTACHMENT_OPTIMAL => AccessFlags::COLOR_ATTACHMENT_WRITE,
+                ImageLayout::TRANSFER_DST_OPTIMAL => AccessFlags::TRANSFER_WRITE,
+                ImageLayout::TRANSFER_SRC_OPTIMAL => AccessFlags::TRANSFER_READ,
+                _ => {
+                    bail!("unknown old layout {:?}", old_layout);
+                }
+            };
+            let dst_access_mask = match new_layout {
+                ImageLayout::COLOR_ATTACHMENT_OPTIMAL => AccessFlags::COLOR_ATTACHMENT_WRITE,
+                ImageLayout::GENERAL => AccessFlags::default(),
+                ImageLayout::TRANSFER_SRC_OPTIMAL => AccessFlags::TRANSFER_READ,
+                ImageLayout::TRANSFER_DST_OPTIMAL => AccessFlags::TRANSFER_WRITE,
+                ImageLayout::PRESENT_SRC_KHR => AccessFlags::COLOR_ATTACHMENT_READ,
+                _ => {
+                    bail!("unknown new layout {:?}", new_layout);
+                }
+            };
+            self.device.cmd_pipeline_barrier(
+                command_buffer,
+                vk::PipelineStageFlags::ALL_COMMANDS,
+                vk::PipelineStageFlags::ALL_COMMANDS,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[vk::ImageMemoryBarrier::builder()
+                    .image(image)
+                    .old_layout(old_layout)
+                    .new_layout(new_layout)
+                    .src_access_mask(src_access_mask)
+                    .dst_access_mask(dst_access_mask)
+                    .subresource_range(
+                        vk::ImageSubresourceRange::builder()
+                            .aspect_mask(vk::ImageAspectFlags::COLOR)
+                            .base_mip_level(0)
+                            .level_count(1)
+                            .base_array_layer(0)
+                            .layer_count(1)
+                            .build(),
+                    )
+                    .build()],
+            );
+            self.image_layout_keeper.insert(image, new_layout);
         }
         Ok(())
     }
