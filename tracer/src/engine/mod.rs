@@ -746,12 +746,19 @@ impl Engine {
                     .usage(vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS | vk::BufferUsageFlags::ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_KHR)
                     .size(std::mem::size_of_val(&instance) as u64)
                     .build(),
-                &vk_mem::AllocationCreateInfo::default(),
+                &vk_mem::AllocationCreateInfo{
+                    usage: MemoryUsage::CpuToGpu,
+                   ..Default::default()
+                },
             )?;
             self.allocation_keeper.push(Allocation {
                 object: VulkanObject::Buffer(instance_buffer),
                 allocation,
             });
+            let mapped = self.allocator.map_memory(&allocation)?;
+            let raw = std::mem::transmute(&instance);
+            std::ptr::copy_nonoverlapping(raw, mapped, std::mem::size_of_val(&instance));
+
             let geometry = vk::AccelerationStructureGeometryKHR::builder()
                 .geometry_type(vk::GeometryTypeKHR::INSTANCES)
                 .geometry(vk::AccelerationStructureGeometryDataKHR {
@@ -785,6 +792,7 @@ impl Engine {
                         .build(),
                     None,
                 )?;
+            dbg!(&as_build_size.acceleration_structure_size);
             self.top_as = Some(top_as);
             self.top_as_buffer = Some(buffer);
         }
@@ -930,6 +938,9 @@ impl Engine {
 
     fn create_shader_binding_table(&mut self) -> Result<()> {
         unsafe {
+            let handle = self
+                .ray_tracing_pipeline_loader
+                .get_ray_tracing_shader_group_handles(self.ray_tracing_pipeline, 0, 3, 3 * 32)?;
             let (buffer, allocation, _) = self.allocator.create_buffer(
                 &vk::BufferCreateInfo::builder()
                     .usage(
@@ -938,16 +949,59 @@ impl Engine {
                     )
                     .size(32)
                     .build(),
-                &vk_mem::AllocationCreateInfo::default(),
+                &vk_mem::AllocationCreateInfo {
+                    usage: MemoryUsage::CpuToGpu,
+                    ..Default::default()
+                },
             )?;
             self.ray_gen_sbt_buffer = Some(buffer);
+            let mapped = self.allocator.map_memory(&allocation)?;
+            std::ptr::copy_nonoverlapping(handle.as_ptr(), mapped, 32);
             self.allocation_keeper.push(Allocation {
                 object: VulkanObject::Buffer(buffer),
                 allocation,
             });
-            let handle = self
-                .ray_tracing_pipeline_loader
-                .get_ray_tracing_shader_group_handles(self.ray_tracing_pipeline, 0, 3, 3 * 32)?;
+            let (buffer, allocation, _) = self.allocator.create_buffer(
+                &vk::BufferCreateInfo::builder()
+                    .usage(
+                        vk::BufferUsageFlags::SHADER_BINDING_TABLE_KHR
+                            | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
+                    )
+                    .size(32)
+                    .build(),
+                &vk_mem::AllocationCreateInfo {
+                    usage: MemoryUsage::CpuToGpu,
+                    ..Default::default()
+                },
+            )?;
+            self.hit_sbt_buffer = Some(buffer);
+            let mapped = self.allocator.map_memory(&allocation)?;
+            std::ptr::copy_nonoverlapping(handle.as_ptr().add(32), mapped, 32);
+            self.allocation_keeper.push(Allocation {
+                object: VulkanObject::Buffer(buffer),
+                allocation,
+            });
+            let (buffer, allocation, _) = self.allocator.create_buffer(
+                &vk::BufferCreateInfo::builder()
+                    .usage(
+                        vk::BufferUsageFlags::SHADER_BINDING_TABLE_KHR
+                            | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
+                    )
+                    .size(32)
+                    .build(),
+                &vk_mem::AllocationCreateInfo {
+                    usage: MemoryUsage::CpuToGpu,
+                    ..Default::default()
+                },
+            )?;
+            self.miss_sbt_buffer = Some(buffer);
+            let mapped = self.allocator.map_memory(&allocation)?;
+            std::ptr::copy_nonoverlapping(handle.as_ptr().add(64), mapped, 32);
+            self.allocation_keeper.push(Allocation {
+                object: VulkanObject::Buffer(buffer),
+                allocation,
+            });
+
             Ok(())
         }
     }
@@ -1002,9 +1056,19 @@ impl Engine {
                     .device_address(
                         self.get_buffer_device_address(self.ray_gen_sbt_buffer.unwrap()),
                     )
+                    .stride(256)
+                    .size(256)
                     .build(),
-                &vk::StridedDeviceAddressRegionKHR::builder().build(),
-                &vk::StridedDeviceAddressRegionKHR::builder().build(),
+                &vk::StridedDeviceAddressRegionKHR::builder()
+                    .device_address(self.get_buffer_device_address(self.miss_sbt_buffer.unwrap()))
+                    .stride(256)
+                    .size(256)
+                    .build(),
+                &vk::StridedDeviceAddressRegionKHR::builder()
+                    .device_address(self.get_buffer_device_address(self.hit_sbt_buffer.unwrap()))
+                    .stride(256)
+                    .size(256)
+                    .build(),
                 &vk::StridedDeviceAddressRegionKHR::default(),
                 800,
                 600,
