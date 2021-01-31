@@ -109,9 +109,9 @@ pub struct Engine {
     top_as: Option<vk::AccelerationStructureKHR>,
     command_pool: vk::CommandPool,
     queue: vk::Queue,
-    ray_gen_sbt_buffer: vk::Buffer,
-    hit_sbt_buffer: vk::Buffer,
-    miss_sbt_buffer: vk::Buffer,
+    ray_gen_sbt_buffer: Option<vk::Buffer>,
+    hit_sbt_buffer: Option<vk::Buffer>,
+    miss_sbt_buffer: Option<vk::Buffer>,
     descriptor_pool: vk::DescriptorPool,
     descriptor_set_layout: Option<vk::DescriptorSetLayout>,
     descriptor_set: Option<vk::DescriptorSet>,
@@ -476,12 +476,12 @@ impl Engine {
                 indices_buffer,
                 transform_buffer,
                 queue,
-                ray_gen_sbt_buffer: vk::Buffer::null(),
-                hit_sbt_buffer: vk::Buffer::null(),
+                ray_gen_sbt_buffer: None,
+                hit_sbt_buffer: None,
                 ray_tracing_pipeline_loader: ray_tracing_pipeline,
                 acceleration_structure_loader: acceleration_structure,
                 ray_tracing_pipeline: vk::Pipeline::null(),
-                miss_sbt_buffer: vk::Buffer::null(),
+                miss_sbt_buffer: None,
                 descriptor_pool,
                 descriptor_set_layout: None,
                 descriptor_set: None,
@@ -932,12 +932,15 @@ impl Engine {
         unsafe {
             let (buffer, allocation, _) = self.allocator.create_buffer(
                 &vk::BufferCreateInfo::builder()
-                    .usage(vk::BufferUsageFlags::SHADER_BINDING_TABLE_KHR)
+                    .usage(
+                        vk::BufferUsageFlags::SHADER_BINDING_TABLE_KHR
+                            | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
+                    )
                     .size(32)
                     .build(),
                 &vk_mem::AllocationCreateInfo::default(),
             )?;
-            self.ray_gen_sbt_buffer = buffer;
+            self.ray_gen_sbt_buffer = Some(buffer);
             self.allocation_keeper.push(Allocation {
                 object: VulkanObject::Buffer(buffer),
                 allocation,
@@ -977,7 +980,7 @@ impl Engine {
                 .to_owned();
 
             self.device
-                .begin_command_buffer(command_buffer, &vk::CommandBufferBeginInfo::default());
+                .begin_command_buffer(command_buffer, &vk::CommandBufferBeginInfo::default())?;
 
             self.device.cmd_bind_pipeline(
                 command_buffer,
@@ -995,7 +998,11 @@ impl Engine {
 
             self.ray_tracing_pipeline_loader.cmd_trace_rays(
                 command_buffer,
-                &vk::StridedDeviceAddressRegionKHR::builder().build(),
+                &vk::StridedDeviceAddressRegionKHR::builder()
+                    .device_address(
+                        self.get_buffer_device_address(self.ray_gen_sbt_buffer.unwrap()),
+                    )
+                    .build(),
                 &vk::StridedDeviceAddressRegionKHR::builder().build(),
                 &vk::StridedDeviceAddressRegionKHR::builder().build(),
                 &vk::StridedDeviceAddressRegionKHR::default(),
@@ -1054,7 +1061,7 @@ impl Engine {
                 self.storage_image.unwrap(),
                 vk::ImageLayout::GENERAL,
             )?;
-            self.device.end_command_buffer(command_buffer);
+            self.device.end_command_buffer(command_buffer)?;
 
             debug!("record complete");
             self.device
@@ -1079,7 +1086,7 @@ impl Engine {
                     .image_indices(&[index])
                     .wait_semaphores(&[self.render_finish_semaphore])
                     .build(),
-            );
+            )?;
 
             info!("frame presented");
         }
@@ -1104,6 +1111,7 @@ impl Engine {
                 ImageLayout::COLOR_ATTACHMENT_OPTIMAL => AccessFlags::COLOR_ATTACHMENT_WRITE,
                 ImageLayout::TRANSFER_DST_OPTIMAL => AccessFlags::TRANSFER_WRITE,
                 ImageLayout::TRANSFER_SRC_OPTIMAL => AccessFlags::TRANSFER_READ,
+                ImageLayout::PRESENT_SRC_KHR => AccessFlags::COLOR_ATTACHMENT_READ,
                 _ => {
                     bail!("unknown old layout {:?}", old_layout);
                 }
@@ -1142,7 +1150,9 @@ impl Engine {
                     )
                     .build()],
             );
-            self.image_layout_keeper.insert(image, new_layout);
+            if let None = self.image_layout_keeper.insert(image, new_layout) {
+                bail!("fuck");
+            }
         }
         Ok(())
     }
