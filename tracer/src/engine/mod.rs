@@ -874,9 +874,10 @@ impl Engine {
         P: AsRef<[u8]>,
     {
         let raw_bytes = spv.as_ref();
-        let mut info = vk::ShaderModuleCreateInfo::builder().build();
-        info.p_code = bytemuck::cast_slice(raw_bytes).as_ptr();
-        info.code_size = raw_bytes.len();
+        let mut info = vk::ShaderModuleCreateInfo::builder()
+            .code(bytemuck::cast_slice(raw_bytes))
+            .build();
+
         unsafe { Ok(self.device.create_shader_module(&info, None)?) }
     }
 
