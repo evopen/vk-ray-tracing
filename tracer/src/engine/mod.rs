@@ -44,6 +44,8 @@ use vk::{
 };
 use vk_mem::{AllocatorCreateFlags, MemoryUsage};
 
+use self::queue::Fence;
+
 const VERTICES: [f32; 9] = [0.25, 0.25, 0.0, 0.75, 0.25, 0.0, 0.50, 0.75, 0.0];
 const INDICES: [u32; 3] = [0, 1, 2];
 const TRANSFORM: [f32; 12] = [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0];
@@ -132,7 +134,7 @@ pub struct Engine {
     image_layout_keeper: BTreeMap<vk::Image, vk::ImageLayout>,
     present_images: Vec<vk::Image>,
     render_finish_semaphore: vk::Semaphore,
-    render_finish_fence: vk::Fence,
+    render_finish_fence: Fence,
     image_available_semaphore: vk::Semaphore,
     instance_buffer: Option<Buffer>,
 }
@@ -440,12 +442,7 @@ impl Engine {
                 device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None)?;
             let image_available_semaphore =
                 device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None)?;
-            let render_finish_fence = device.create_fence(
-                &vk::FenceCreateInfo::builder()
-                    .flags(vk::FenceCreateFlags::SIGNALED)
-                    .build(),
-                None,
-            )?;
+            let render_finish_fence = Fence::new(&device, true)?;
 
             Ok(Self {
                 size,
@@ -670,6 +667,8 @@ impl Engine {
                 })
                 .build();
 
+            let num_triangles = 1;
+
             let build_geometry_info = vk::AccelerationStructureBuildGeometryInfoKHR::builder()
                 .ty(vk::AccelerationStructureTypeKHR::BOTTOM_LEVEL)
                 .geometries(&[geometry])
@@ -680,7 +679,7 @@ impl Engine {
                     self.device.handle(),
                     vk::AccelerationStructureBuildTypeKHR::DEVICE,
                     &build_geometry_info,
-                    &[1],
+                    &[num_triangles],
                 );
             let buffer = self.create_acceleration_structure_buffer(as_build_size)?;
 
@@ -697,7 +696,13 @@ impl Engine {
             self.bottom_as_buffer = Some(buffer);
             self.bottom_as = Some(bottom_as);
 
-            let build_range_info = vk::AccelerationStructureBuildRangeInfoKHR::builder().build();
+            let build_range_info = vk::AccelerationStructureBuildRangeInfoKHR::builder()
+                .primitive_count(num_triangles)
+                .build();
+            // let command_buffer = CommandBuffer::new(self.device.clone(), self.command_pool)?;
+            // command_buffer.begin()?;
+            // command_buffer.end()?;
+            // self.queue.submit(command_buffer, &[], &[], &[])?.wait()?;
         }
 
         Ok(())
@@ -1071,9 +1076,7 @@ impl Engine {
             self.device.end_command_buffer(command_buffer.handle())?;
 
             debug!("record complete");
-            self.device
-                .wait_for_fences(&[self.render_finish_fence], true, std::u64::MAX)?;
-            self.device.reset_fences(&[self.render_finish_fence])?;
+            self.render_finish_fence.wait();
             debug!("render finished");
 
             self.render_finish_fence = self.queue.submit(

@@ -45,6 +45,21 @@ impl CommandBuffer {
             Ok(())
         }
     }
+
+    pub fn begin(&self) -> Result<()> {
+        unsafe {
+            self.device
+                .begin_command_buffer(self.handle, &vk::CommandBufferBeginInfo::default())?;
+            Ok(())
+        }
+    }
+
+    pub fn end(&self) -> Result<()> {
+        unsafe {
+            self.device.end_command_buffer(self.handle)?;
+            Ok(())
+        }
+    }
 }
 
 impl Drop for CommandBuffer {

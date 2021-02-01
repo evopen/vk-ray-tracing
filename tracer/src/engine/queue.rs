@@ -9,6 +9,55 @@ pub struct Queue {
     device: ash::Device,
 }
 
+pub struct Fence {
+    handle: vk::Fence,
+    device: ash::Device,
+}
+
+impl Fence {
+    pub fn new(device: &ash::Device, signaled: bool) -> Result<Self> {
+        unsafe {
+            let device = device.clone();
+            let handle = device.create_fence(
+                &vk::FenceCreateInfo::builder()
+                    .flags(match signaled {
+                        true => vk::FenceCreateFlags::SIGNALED,
+                        false => vk::FenceCreateFlags::empty(),
+                    })
+                    .build(),
+                None,
+            )?;
+            Ok(Self { handle, device })
+        }
+    }
+
+    pub fn wait(&self) -> Result<()> {
+        unsafe {
+            self.device
+                .wait_for_fences(&[self.handle], true, std::u64::MAX)?;
+            Ok(())
+        }
+    }
+
+    pub fn reset(&self) -> Result<()> {
+        unsafe {
+            self.device.reset_fences(&[self.handle])?;
+            Ok(())
+        }
+    }
+
+    pub fn handle(&self) -> vk::Fence {
+        self.handle
+    }
+}
+
+impl Drop for Fence {
+    fn drop(&mut self) {
+        self.wait().unwrap();
+        unsafe { self.device.destroy_fence(self.handle, None) }
+    }
+}
+
 impl Queue {
     pub fn new(device: &ash::Device, queue_family_index: u32, queue_index: u32) -> Result<Self> {
         unsafe {
@@ -24,11 +73,10 @@ impl Queue {
         wait_semaphores: &[vk::Semaphore],
         wait_stages: &[vk::PipelineStageFlags],
         signal_semaphores: &[vk::Semaphore],
-    ) -> Result<vk::Fence> {
+    ) -> Result<Fence> {
         unsafe {
-            let fence = self
-                .device
-                .create_fence(&vk::FenceCreateInfo::default(), None)?;
+            debug!("submitted");
+            let fence = Fence::new(&self.device, false)?;
 
             let mut submit_info = vk::SubmitInfo::builder()
                 .command_buffers(&[command_buffer.handle()])
@@ -38,14 +86,17 @@ impl Queue {
                 .build();
 
             self.device
-                .queue_submit(self.handle, &[submit_info], fence)?;
-
+                .queue_submit(self.handle, &[submit_info], fence.handle)?;
+            debug!("submitted to device");
             let device = self.device.clone();
+            let handle = fence.handle;
             tokio::task::spawn(async move {
+                debug!("waiting");
                 device
-                    .wait_for_fences(&[fence], true, std::u64::MAX)
+                    .wait_for_fences(&[handle], true, std::u64::MAX)
                     .unwrap();
                 drop(command_buffer);
+                debug!("freed");
             });
 
             Ok(fence)
