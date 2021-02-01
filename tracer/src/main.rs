@@ -55,10 +55,10 @@ fn main() -> Result<()> {
         .build(&event_loop)
         .unwrap();
 
-    let mut engine = Engine::new(&window).unwrap();
-    engine.init().unwrap();
-
     rt.block_on(async {
+        let mut engine = Engine::new(&window).unwrap();
+        engine.init().unwrap();
+
         event_loop.run(move |event, _, control_flow| {
             *control_flow = winit::event_loop::ControlFlow::Poll;
             match event {
