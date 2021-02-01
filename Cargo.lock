@@ -1530,6 +1530,7 @@ dependencies = [
  "gltf",
  "log",
  "nfd2",
+ "num-traits",
  "rand_core",
  "rand_xorshift",
  "rayon",
