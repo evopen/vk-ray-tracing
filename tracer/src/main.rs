@@ -42,7 +42,7 @@ fn main() -> Result<()> {
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_io()
-        .worker_threads(4)
+        .worker_threads(16)
         .build()
         .unwrap();
 
@@ -58,44 +58,46 @@ fn main() -> Result<()> {
     let mut engine = Engine::new(&window).unwrap();
     engine.init().unwrap();
 
-    event_loop.run(move |event, _, control_flow| {
-        *control_flow = winit::event_loop::ControlFlow::Poll;
-        match event {
-            winit::event::Event::NewEvents(_) => {}
-            winit::event::Event::WindowEvent { window_id, event } => {
-                engine.input(&event);
-                match event {
-                    winit::event::WindowEvent::CloseRequested => {
-                        *control_flow = winit::event_loop::ControlFlow::Exit;
-                    }
-                    winit::event::WindowEvent::KeyboardInput {
-                        device_id,
-                        input,
-                        is_synthetic,
-                    } => match input {
-                        winit::event::KeyboardInput {
-                            virtual_keycode: Some(winit::event::VirtualKeyCode::Escape),
-                            state: winit::event::ElementState::Pressed,
-                            ..
-                        } => {
+    rt.block_on(async {
+        event_loop.run(move |event, _, control_flow| {
+            *control_flow = winit::event_loop::ControlFlow::Poll;
+            match event {
+                winit::event::Event::NewEvents(_) => {}
+                winit::event::Event::WindowEvent { window_id, event } => {
+                    engine.input(&event);
+                    match event {
+                        winit::event::WindowEvent::CloseRequested => {
                             *control_flow = winit::event_loop::ControlFlow::Exit;
                         }
+                        winit::event::WindowEvent::KeyboardInput {
+                            device_id,
+                            input,
+                            is_synthetic,
+                        } => match input {
+                            winit::event::KeyboardInput {
+                                virtual_keycode: Some(winit::event::VirtualKeyCode::Escape),
+                                state: winit::event::ElementState::Pressed,
+                                ..
+                            } => {
+                                *control_flow = winit::event_loop::ControlFlow::Exit;
+                            }
+                            _ => {}
+                        },
                         _ => {}
-                    },
-                    _ => {}
+                    }
                 }
+                winit::event::Event::MainEventsCleared => {
+                    window.request_redraw();
+                }
+                winit::event::Event::RedrawRequested(_) => {
+                    engine.update().unwrap();
+                    engine.render().unwrap();
+                }
+                winit::event::Event::RedrawEventsCleared => {}
+                winit::event::Event::LoopDestroyed => {}
+                _ => {}
             }
-            winit::event::Event::MainEventsCleared => {
-                window.request_redraw();
-            }
-            winit::event::Event::RedrawRequested(_) => {
-                engine.update().unwrap();
-                engine.render().unwrap();
-            }
-            winit::event::Event::RedrawEventsCleared => {}
-            winit::event::Event::LoopDestroyed => {}
-            _ => {}
-        }
+        });
     });
 
     Ok(())

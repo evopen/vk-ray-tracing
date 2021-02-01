@@ -1074,16 +1074,14 @@ impl Engine {
                 .wait_for_fences(&[self.render_finish_fence], true, std::u64::MAX)?;
             self.device.reset_fences(&[self.render_finish_fence])?;
             debug!("render finished");
-            self.device.queue_submit(
-                self.queue.handle(),
-                &[vk::SubmitInfo::builder()
-                    .command_buffers(&[command_buffer.handle()])
-                    .wait_semaphores(&[self.image_available_semaphore])
-                    .wait_dst_stage_mask(&[vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT])
-                    .signal_semaphores(&[self.render_finish_semaphore])
-                    .build()],
-                self.render_finish_fence,
+
+            self.render_finish_fence = self.queue.submit(
+                command_buffer,
+                &[self.image_available_semaphore],
+                &[vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT],
+                &[self.render_finish_semaphore],
             )?;
+
             debug!("command submitted");
             self.swapchain_loader.queue_present(
                 self.queue.handle(),
