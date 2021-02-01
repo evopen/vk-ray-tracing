@@ -1,5 +1,5 @@
 use rust_embed::RustEmbed;
 
 #[derive(RustEmbed)]
-#[folder = "src/engine/shaders/target"]
+#[folder = "../target/spirv"]
 pub(super) struct Shaders;
