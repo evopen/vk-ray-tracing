@@ -4,6 +4,7 @@ mod command_buffer;
 mod queue;
 mod shaders;
 
+use acceleration_structure::AccelerationStructure;
 use buffer::Buffer;
 use command_buffer::CommandBuffer;
 use queue::Queue;
@@ -29,7 +30,7 @@ use anyhow::{bail, Context, Result};
 
 use ash::{
     extensions::ext::DebugUtils,
-    extensions::khr::AccelerationStructure,
+    extensions::khr::AccelerationStructure as AccelerationStructureLoader,
     extensions::khr::DeferredHostOperations,
     extensions::khr::RayTracingPipeline,
     extensions::khr::Surface,
@@ -112,8 +113,7 @@ pub struct Engine {
     transform_buffer: Buffer,
     ray_tracing_pipeline_loader: RayTracingPipeline,
     ray_tracing_pipeline: vk::Pipeline,
-    acceleration_structure_loader: AccelerationStructure,
-    bottom_as: Option<vk::AccelerationStructureKHR>,
+    acceleration_structure_loader: AccelerationStructureLoader,
     top_as: Option<vk::AccelerationStructureKHR>,
     command_pool: vk::CommandPool,
     queue: Queue,
@@ -126,7 +126,6 @@ pub struct Engine {
     allocation_keeper: Vec<Allocation>,
     pipeline_layout: Option<vk::PipelineLayout>,
     top_as_buffer: Option<Buffer>,
-    bottom_as_buffer: Option<Buffer>,
     swapchain_loader: Swapchain,
     swapchain: vk::SwapchainKHR,
     storage_image: Option<vk::Image>,
@@ -137,6 +136,7 @@ pub struct Engine {
     render_finish_fence: Arc<Box<Fence>>,
     image_available_semaphore: vk::Semaphore,
     instance_buffer: Option<Buffer>,
+    bottom_as: Option<AccelerationStructure>,
     allocator: vk_mem::Allocator,
 }
 
@@ -241,7 +241,7 @@ impl Engine {
             let queue_family_index = queue_family_index as u32;
             let device_extension_names_raw = [
                 Swapchain::name().as_ptr(),
-                AccelerationStructure::name().as_ptr(),
+                AccelerationStructureLoader::name().as_ptr(),
                 RayTracingPipeline::name().as_ptr(),
                 DeferredHostOperations::name().as_ptr(),
                 CStr::from_bytes_with_nul(b"VK_KHR_buffer_device_address\0")?.as_ptr(),
@@ -390,7 +390,8 @@ impl Engine {
             let device_memory_properties = instance.get_physical_device_memory_properties(pdevice);
 
             let ray_tracing_pipeline = RayTracingPipeline::new(&instance, &device);
-            let acceleration_structure = AccelerationStructure::new(&instance, &device);
+            let acceleration_structure_loader =
+                AccelerationStructureLoader::new(&instance, &device);
             let mut allocator = vk_mem::Allocator::new(&vk_mem::AllocatorCreateInfo {
                 physical_device: pdevice.clone(),
                 device: device.clone(),
@@ -459,7 +460,7 @@ impl Engine {
                 ray_gen_sbt_buffer: None,
                 hit_sbt_buffer: None,
                 ray_tracing_pipeline_loader: ray_tracing_pipeline,
-                acceleration_structure_loader: acceleration_structure,
+                acceleration_structure_loader,
                 ray_tracing_pipeline: vk::Pipeline::null(),
                 miss_sbt_buffer: None,
                 descriptor_pool,
@@ -468,10 +469,8 @@ impl Engine {
                 allocation_keeper,
                 pipeline_layout: None,
                 top_as_buffer: None,
-                bottom_as_buffer: None,
                 swapchain_loader,
                 swapchain,
-                bottom_as: None,
                 top_as: None,
                 storage_image: None,
                 storage_image_view: None,
@@ -481,6 +480,7 @@ impl Engine {
                 image_available_semaphore,
                 render_finish_fence,
                 instance_buffer: None,
+                bottom_as: None,
             })
         }
     }
@@ -667,70 +667,17 @@ impl Engine {
                         .build(),
                 })
                 .build();
+            let bottom_as = AccelerationStructure::new(
+                &self.device,
+                self.command_pool,
+                &self.queue,
+                &self.acceleration_structure_loader,
+                &self.allocator,
+                &[geometry],
+                vk::AccelerationStructureTypeKHR::BOTTOM_LEVEL,
+            )?;
 
-            let num_triangles = 1;
-
-            let mut build_geometry_info = vk::AccelerationStructureBuildGeometryInfoKHR::builder()
-                .ty(vk::AccelerationStructureTypeKHR::BOTTOM_LEVEL)
-                .geometries(&[geometry])
-                .build();
-            let as_build_size = self
-                .acceleration_structure_loader
-                .get_acceleration_structure_build_sizes(
-                    self.device.handle(),
-                    vk::AccelerationStructureBuildTypeKHR::DEVICE,
-                    &build_geometry_info,
-                    &[num_triangles],
-                );
-            let buffer = self.create_acceleration_structure_buffer(as_build_size)?;
-
-            let bottom_as = self
-                .acceleration_structure_loader
-                .create_acceleration_structure(
-                    &vk::AccelerationStructureCreateInfoKHR::builder()
-                        .buffer(buffer.handle)
-                        .size(as_build_size.acceleration_structure_size)
-                        .ty(vk::AccelerationStructureTypeKHR::BOTTOM_LEVEL)
-                        .build(),
-                    None,
-                )?;
-            self.bottom_as_buffer = Some(buffer);
             self.bottom_as = Some(bottom_as);
-
-            let build_range_info = vk::AccelerationStructureBuildRangeInfoKHR::builder()
-                .primitive_count(num_triangles)
-                .build();
-
-            let scratch_buffer = Buffer::new(
-                as_build_size.build_scratch_size,
-                vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
-                MemoryUsage::GpuOnly,
-                self.allocator.clone(),
-            )?;
-
-            build_geometry_info.dst_acceleration_structure = self.bottom_as.unwrap();
-            build_geometry_info.mode = vk::BuildAccelerationStructureModeKHR::BUILD;
-            build_geometry_info.scratch_data = vk::DeviceOrHostAddressKHR {
-                device_address: scratch_buffer.device_address(),
-            };
-            let command_buffer = CommandBuffer::new(&self.device, self.command_pool)?;
-            command_buffer.begin()?;
-            self.acceleration_structure_loader
-                .cmd_build_acceleration_structures(
-                    command_buffer.handle(),
-                    &[build_geometry_info],
-                    &[&[build_range_info]],
-                );
-            command_buffer.end()?;
-            let semaphore = TimelineSemaphore::new(&self.device)?;
-            self.queue.submit_timeline(
-                command_buffer,
-                &[&semaphore],
-                &[0],
-                &[vk::PipelineStageFlags::ALL_COMMANDS],
-                &[1],
-            )?;
-            semaphore.wait_for(1)?;
         }
 
         Ok(())
@@ -748,7 +695,7 @@ impl Engine {
                         .get_acceleration_structure_device_address(
                             self.device.handle(),
                             &vk::AccelerationStructureDeviceAddressInfoKHR::builder()
-                                .acceleration_structure(self.bottom_as.unwrap())
+                                .acceleration_structure(self.bottom_as.as_ref().unwrap().handle())
                                 .build(),
                         ),
                 },
