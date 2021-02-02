@@ -1,3 +1,5 @@
+use std::mem::ManuallyDrop;
+
 use anyhow::{Context, Result};
 use ash::{version::DeviceV1_2, vk};
 use log::debug;
@@ -6,7 +8,7 @@ use vk_mem::AllocationCreateInfo;
 pub struct Buffer {
     pub handle: vk::Buffer,
     allocation: vk_mem::Allocation,
-    allocator: vk_mem::Allocator,
+    allocator: ManuallyDrop<vk_mem::Allocator>,
     mapped: bool,
     device_address: Option<vk::DeviceAddress>,
 }
@@ -49,7 +51,7 @@ impl Buffer {
             Ok(Self {
                 handle,
                 allocation,
-                allocator,
+                allocator: ManuallyDrop::new(allocator),
                 mapped: false,
                 device_address,
             })
@@ -74,9 +76,7 @@ impl Buffer {
 impl Drop for Buffer {
     fn drop(&mut self) {
         if self.mapped {
-            debug!("unmapping");
             self.unmap();
-            debug!("unmapped");
         }
         self.allocator.destroy_buffer(self.handle, &self.allocation);
     }

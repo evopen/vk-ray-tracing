@@ -33,7 +33,6 @@ use ash::{
     extensions::khr::RayTracingPipeline,
     extensions::khr::Surface,
     extensions::khr::Swapchain,
-    extensions::khr::TimelineSemaphore,
     version::{DeviceV1_0, DeviceV1_2, EntryV1_0, InstanceV1_0, InstanceV1_2},
 };
 use ash::{vk, Device, Entry, Instance};
@@ -45,7 +44,7 @@ use vk::{
 };
 use vk_mem::{AllocatorCreateFlags, MemoryUsage};
 
-use self::queue::Fence;
+use self::queue::{Fence, TimelineSemaphore};
 
 const VERTICES: [f32; 9] = [0.25, 0.25, 0.0, 0.75, 0.25, 0.0, 0.50, 0.75, 0.0];
 const INDICES: [u32; 3] = [0, 1, 2];
@@ -700,10 +699,18 @@ impl Engine {
             let build_range_info = vk::AccelerationStructureBuildRangeInfoKHR::builder()
                 .primitive_count(num_triangles)
                 .build();
-            // let command_buffer = CommandBuffer::new(self.device.clone(), self.command_pool)?;
-            // command_buffer.begin()?;
-            // command_buffer.end()?;
-            // self.queue.submit(command_buffer, &[], &[], &[])?.wait()?;
+            let command_buffer = CommandBuffer::new(self.device.clone(), self.command_pool)?;
+            command_buffer.begin()?;
+            command_buffer.end()?;
+            let semaphore = TimelineSemaphore::new(&self.device)?;
+            self.queue.submit_timeline(
+                command_buffer,
+                &[&semaphore],
+                &[0],
+                &[vk::PipelineStageFlags::ALL_COMMANDS],
+                &[1],
+            )?;
+            semaphore.wait_for(1)?;
         }
 
         Ok(())
