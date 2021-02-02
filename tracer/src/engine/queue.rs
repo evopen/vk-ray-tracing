@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use anyhow::Result;
 use ash::{version::DeviceV1_0, vk};
 use log::debug;
@@ -67,16 +69,20 @@ impl Queue {
         }
     }
 
-    pub fn submit(
+    pub fn submit_timeline(&self) {
+        unsafe {}
+    }
+
+    pub fn submit_binary(
         &self,
         command_buffer: CommandBuffer,
         wait_semaphores: &[vk::Semaphore],
         wait_stages: &[vk::PipelineStageFlags],
         signal_semaphores: &[vk::Semaphore],
-    ) -> Result<Fence> {
+    ) -> Result<Arc<Box<Fence>>> {
         unsafe {
             debug!("submitted");
-            let fence = Fence::new(&self.device, false)?;
+            let fence = Arc::new(Box::new(Fence::new(&self.device, false)?));
 
             let mut submit_info = vk::SubmitInfo::builder()
                 .command_buffers(&[command_buffer.handle()])
@@ -90,10 +96,11 @@ impl Queue {
             debug!("submitted to device");
             let device = self.device.clone();
             let handle = fence.handle;
+            let cmd_buffer_freer = fence.clone();
             tokio::task::spawn(async move {
                 debug!("waiting");
                 device
-                    .wait_for_fences(&[handle], true, std::u64::MAX)
+                    .wait_for_fences(&[cmd_buffer_freer.handle()], true, std::u64::MAX)
                     .unwrap();
                 drop(command_buffer);
                 debug!("freed");

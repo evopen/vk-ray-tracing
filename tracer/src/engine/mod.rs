@@ -18,6 +18,7 @@ use std::{
     io::Write,
     mem::size_of_val,
     path::Path,
+    sync::Arc,
     time::Duration,
 };
 
@@ -134,7 +135,7 @@ pub struct Engine {
     image_layout_keeper: BTreeMap<vk::Image, vk::ImageLayout>,
     present_images: Vec<vk::Image>,
     render_finish_semaphore: vk::Semaphore,
-    render_finish_fence: Fence,
+    render_finish_fence: Arc<Box<Fence>>,
     image_available_semaphore: vk::Semaphore,
     instance_buffer: Option<Buffer>,
 }
@@ -442,7 +443,7 @@ impl Engine {
                 device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None)?;
             let image_available_semaphore =
                 device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None)?;
-            let render_finish_fence = Fence::new(&device, true)?;
+            let render_finish_fence = Arc::new(Box::new(Fence::new(&device, true)?));
 
             Ok(Self {
                 size,
@@ -1079,7 +1080,7 @@ impl Engine {
             self.render_finish_fence.wait();
             debug!("render finished");
 
-            self.render_finish_fence = self.queue.submit(
+            self.render_finish_fence = self.queue.submit_binary(
                 command_buffer,
                 &[self.image_available_semaphore],
                 &[vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT],
