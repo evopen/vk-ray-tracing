@@ -1,3 +1,4 @@
+mod acceleration_structure;
 mod buffer;
 mod command_buffer;
 mod queue;
@@ -104,7 +105,6 @@ struct Allocation {
 pub struct Engine {
     size: winit::dpi::PhysicalSize<u32>,
     entry: Entry,
-    allocator: vk_mem::Allocator,
     device: Device,
     instance: Instance,
     vertices_buffer: Buffer,
@@ -137,6 +137,7 @@ pub struct Engine {
     render_finish_fence: Arc<Box<Fence>>,
     image_available_semaphore: vk::Semaphore,
     instance_buffer: Option<Buffer>,
+    allocator: vk_mem::Allocator,
 }
 
 impl Engine {
@@ -559,7 +560,7 @@ impl Engine {
                 .device
                 .create_fence(&vk::FenceCreateInfo::default(), None)?;
 
-            let command_buffer = CommandBuffer::new(self.device.clone(), self.command_pool)?;
+            let command_buffer = CommandBuffer::new(&self.device, self.command_pool)?;
 
             self.device.begin_command_buffer(
                 command_buffer.handle(),
@@ -669,7 +670,7 @@ impl Engine {
 
             let num_triangles = 1;
 
-            let build_geometry_info = vk::AccelerationStructureBuildGeometryInfoKHR::builder()
+            let mut build_geometry_info = vk::AccelerationStructureBuildGeometryInfoKHR::builder()
                 .ty(vk::AccelerationStructureTypeKHR::BOTTOM_LEVEL)
                 .geometries(&[geometry])
                 .build();
@@ -699,8 +700,27 @@ impl Engine {
             let build_range_info = vk::AccelerationStructureBuildRangeInfoKHR::builder()
                 .primitive_count(num_triangles)
                 .build();
-            let command_buffer = CommandBuffer::new(self.device.clone(), self.command_pool)?;
+
+            let scratch_buffer = Buffer::new(
+                as_build_size.build_scratch_size,
+                vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
+                MemoryUsage::GpuOnly,
+                self.allocator.clone(),
+            )?;
+
+            build_geometry_info.dst_acceleration_structure = self.bottom_as.unwrap();
+            build_geometry_info.mode = vk::BuildAccelerationStructureModeKHR::BUILD;
+            build_geometry_info.scratch_data = vk::DeviceOrHostAddressKHR {
+                device_address: scratch_buffer.device_address(),
+            };
+            let command_buffer = CommandBuffer::new(&self.device, self.command_pool)?;
             command_buffer.begin()?;
+            self.acceleration_structure_loader
+                .cmd_build_acceleration_structures(
+                    command_buffer.handle(),
+                    &[build_geometry_info],
+                    &[&[build_range_info]],
+                );
             command_buffer.end()?;
             let semaphore = TimelineSemaphore::new(&self.device)?;
             self.queue.submit_timeline(
@@ -977,7 +997,7 @@ impl Engine {
                 vk::Fence::null(),
             )?;
 
-            let command_buffer = CommandBuffer::new(self.device.clone(), self.command_pool)?;
+            let command_buffer = CommandBuffer::new(&self.device, self.command_pool)?;
 
             self.device.begin_command_buffer(
                 command_buffer.handle(),

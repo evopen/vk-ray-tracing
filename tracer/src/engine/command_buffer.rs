@@ -8,8 +8,9 @@ pub struct CommandBuffer {
 }
 
 impl CommandBuffer {
-    pub fn new(device: ash::Device, pool: vk::CommandPool) -> Result<Self> {
+    pub fn new(device: &ash::Device, pool: vk::CommandPool) -> Result<Self> {
         unsafe {
+            let device = device.clone();
             let handle = device
                 .allocate_command_buffers(
                     &vk::CommandBufferAllocateInfo::builder()
