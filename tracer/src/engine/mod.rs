@@ -682,14 +682,7 @@ impl Engine {
                 instance_custom_index_and_mask: 0xFF,
                 instance_shader_binding_table_record_offset_and_flags: 0x01,
                 acceleration_structure_reference: vk::AccelerationStructureReferenceKHR {
-                    device_handle: self
-                        .acceleration_structure_loader
-                        .get_acceleration_structure_device_address(
-                            self.device.handle(),
-                            &vk::AccelerationStructureDeviceAddressInfoKHR::builder()
-                                .acceleration_structure(self.bottom_as.as_ref().unwrap().handle())
-                                .build(),
-                        ),
+                    device_handle: self.bottom_as.as_ref().unwrap().device_address(),
                 },
             };
             let mut instance_buffer = Buffer::new(
@@ -731,6 +724,7 @@ impl Engine {
             )?;
 
             self.top_as = Some(top_as);
+            self.instance_buffer = Some(instance_buffer);
         }
         Ok(())
     }
@@ -772,6 +766,7 @@ impl Engine {
                     vk::DeferredOperationKHR::null(),
                     vk::PipelineCache::null(),
                     &[vk::RayTracingPipelineCreateInfoKHR::builder()
+                        .max_pipeline_ray_recursion_depth(1)
                         .layout(self.pipeline_layout.unwrap())
                         .stages(&[
                             vk::PipelineShaderStageCreateInfo::builder()
