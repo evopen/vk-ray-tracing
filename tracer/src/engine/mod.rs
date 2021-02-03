@@ -124,7 +124,6 @@ pub struct Engine {
     descriptor_pool: vk::DescriptorPool,
     descriptor_set_layout: Option<vk::DescriptorSetLayout>,
     descriptor_set: Option<vk::DescriptorSet>,
-    allocation_keeper: Vec<Allocation>,
     pipeline_layout: Option<vk::PipelineLayout>,
     swapchain_loader: khr::Swapchain,
     swapchain: Swapchain,
@@ -327,7 +326,6 @@ impl Engine {
                 flags: vk_mem::AllocatorCreateFlags::from_bits_unchecked(0x0000_0020),
                 ..Default::default()
             })?;
-            let mut allocation_keeper = Vec::new();
 
             let descriptor_pool = device.create_descriptor_pool(
                 &vk::DescriptorPoolCreateInfo::builder()
@@ -408,7 +406,6 @@ impl Engine {
                 descriptor_pool,
                 descriptor_set_layout: None,
                 descriptor_set: None,
-                allocation_keeper,
                 pipeline_layout: None,
                 swapchain_loader,
                 swapchain,
@@ -448,28 +445,6 @@ impl Engine {
 
     fn create_storage_image(&mut self) -> Result<()> {
         unsafe {
-            let (image, allocation, _) = self.allocator.create_image(
-                &vk::ImageCreateInfo::builder()
-                    .image_type(vk::ImageType::TYPE_2D)
-                    .format(vk::Format::B8G8R8A8_UNORM)
-                    .extent(
-                        vk::Extent3D::builder()
-                            .width(800)
-                            .height(600)
-                            .depth(1)
-                            .build(),
-                    )
-                    .mip_levels(1)
-                    .array_layers(1)
-                    .samples(vk::SampleCountFlags::TYPE_1)
-                    .tiling(vk::ImageTiling::OPTIMAL)
-                    .usage(vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::STORAGE)
-                    .initial_layout(vk::ImageLayout::UNDEFINED)
-                    .sharing_mode(vk::SharingMode::EXCLUSIVE)
-                    .build(),
-                &vk_mem::AllocationCreateInfo::default(),
-            )?;
-
             let mut image = Image::new(
                 800,
                 600,
@@ -988,20 +963,5 @@ impl Engine {
             info!("frame presented");
         }
         Ok(())
-    }
-}
-
-impl Drop for Engine {
-    fn drop(&mut self) {
-        self.allocation_keeper
-            .iter()
-            .for_each(|allocation| match allocation.object {
-                VulkanObject::Buffer(buffer) => self
-                    .allocator
-                    .destroy_buffer(buffer, &allocation.allocation),
-                VulkanObject::Image(image) => {
-                    self.allocator.destroy_image(image, &allocation.allocation)
-                }
-            });
     }
 }
