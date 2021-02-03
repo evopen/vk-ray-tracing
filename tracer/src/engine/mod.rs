@@ -35,7 +35,7 @@ use ash::{
     extensions::khr::RayTracingPipeline,
     extensions::khr::Surface,
     extensions::khr::Swapchain,
-    version::{DeviceV1_0, DeviceV1_2, EntryV1_0, InstanceV1_0, InstanceV1_2},
+    version::{DeviceV1_0, DeviceV1_2, EntryV1_0, InstanceV1_0, InstanceV1_1, InstanceV1_2},
 };
 use ash::{vk, Device, Entry, Instance};
 use bytemuck::cast_slice;
@@ -130,6 +130,7 @@ pub struct Engine {
     storage_image_view: Option<vk::ImageView>,
     image_layout_keeper: BTreeMap<vk::Image, vk::ImageLayout>,
     present_images: Vec<vk::Image>,
+    ray_tracing_pipeline_properties: vk::PhysicalDeviceRayTracingPipelinePropertiesKHR,
     render_finish_semaphore: vk::Semaphore,
     render_finish_fence: Arc<Box<Fence>>,
     image_available_semaphore: vk::Semaphore,
@@ -445,7 +446,18 @@ impl Engine {
                 device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None)?;
             let render_finish_fence = Arc::new(Box::new(Fence::new(&device, true)?));
 
+            let mut ray_tracing_pipeline_properties =
+                vk::PhysicalDeviceRayTracingPipelinePropertiesKHR::default();
+            instance.get_physical_device_properties2(
+                pdevice,
+                &mut vk::PhysicalDeviceProperties2::builder()
+                    .push_next(&mut ray_tracing_pipeline_properties)
+                    .build(),
+            );
+            dbg!(&ray_tracing_pipeline_properties);
+
             Ok(Self {
+                ray_tracing_pipeline_properties,
                 size,
                 entry,
                 allocator,
@@ -864,11 +876,22 @@ impl Engine {
 
     fn create_shader_binding_table(&mut self) -> Result<()> {
         unsafe {
+            let handle_size = self
+                .ray_tracing_pipeline_properties
+                .shader_group_handle_size as usize;
+            let handle_size_aligned = self
+                .ray_tracing_pipeline_properties
+                .shader_group_handle_alignment as usize;
             let handle = self
                 .ray_tracing_pipeline_loader
-                .get_ray_tracing_shader_group_handles(self.ray_tracing_pipeline, 0, 3, 3 * 32)?;
+                .get_ray_tracing_shader_group_handles(
+                    self.ray_tracing_pipeline,
+                    0,
+                    3,
+                    3 * handle_size_aligned,
+                )?;
             let mut buffer = Buffer::new(
-                32,
+                handle_size,
                 vk::BufferUsageFlags::SHADER_BINDING_TABLE_KHR
                     | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
                 MemoryUsage::CpuToGpu,
@@ -877,28 +900,39 @@ impl Engine {
 
             let mapped = buffer.map()?;
             std::ptr::copy_nonoverlapping(handle.as_ptr(), mapped, 32);
+            buffer.unmap();
             self.ray_gen_sbt_buffer = Some(buffer);
 
             let mut buffer = Buffer::new(
-                32,
+                handle_size,
                 vk::BufferUsageFlags::SHADER_BINDING_TABLE_KHR
                     | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
                 MemoryUsage::CpuToGpu,
                 self.allocator.clone(),
             )?;
             let mapped = buffer.map()?;
-            std::ptr::copy_nonoverlapping(handle.as_ptr().add(32), mapped, 32);
+            std::ptr::copy_nonoverlapping(
+                handle.as_ptr().add(handle_size_aligned),
+                mapped,
+                handle_size,
+            );
+            buffer.unmap();
             self.hit_sbt_buffer = Some(buffer);
 
             let mut buffer = Buffer::new(
-                32,
+                handle_size,
                 vk::BufferUsageFlags::SHADER_BINDING_TABLE_KHR
                     | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
                 MemoryUsage::CpuToGpu,
                 self.allocator.clone(),
             )?;
             let mapped = buffer.map()?;
-            std::ptr::copy_nonoverlapping(handle.as_ptr().add(64), mapped, 32);
+            std::ptr::copy_nonoverlapping(
+                handle.as_ptr().add(handle_size_aligned * 2),
+                mapped,
+                handle_size,
+            );
+            buffer.unmap();
             self.miss_sbt_buffer = Some(buffer);
 
             Ok(())
@@ -919,6 +953,9 @@ impl Engine {
                 self.image_available_semaphore,
                 vk::Fence::null(),
             )?;
+            let handle_size_aligned = self
+                .ray_tracing_pipeline_properties
+                .shader_group_handle_alignment as u64;
 
             let command_buffer = CommandBuffer::new(&self.device, self.command_pool)?;
 
@@ -944,29 +981,19 @@ impl Engine {
             self.ray_tracing_pipeline_loader.cmd_trace_rays(
                 command_buffer.handle(),
                 &vk::StridedDeviceAddressRegionKHR::builder()
-                    .device_address(self.get_buffer_device_address(
-                        self.ray_gen_sbt_buffer.as_ref().unwrap().handle,
-                    ))
-                    .stride(256)
-                    .size(256)
+                    .device_address(self.ray_gen_sbt_buffer.as_ref().unwrap().device_address()?)
+                    .stride(handle_size_aligned)
+                    .size(handle_size_aligned)
                     .build(),
                 &vk::StridedDeviceAddressRegionKHR::builder()
-                    .device_address(
-                        self.get_buffer_device_address(
-                            self.miss_sbt_buffer.as_ref().unwrap().handle,
-                        ),
-                    )
-                    .stride(256)
-                    .size(256)
+                    .device_address(self.miss_sbt_buffer.as_ref().unwrap().device_address()?)
+                    .stride(handle_size_aligned)
+                    .size(handle_size_aligned)
                     .build(),
                 &vk::StridedDeviceAddressRegionKHR::builder()
-                    .device_address(
-                        self.get_buffer_device_address(
-                            self.hit_sbt_buffer.as_ref().unwrap().handle,
-                        ),
-                    )
-                    .stride(256)
-                    .size(256)
+                    .device_address(self.hit_sbt_buffer.as_ref().unwrap().device_address()?)
+                    .stride(handle_size_aligned)
+                    .size(handle_size_aligned)
                     .build(),
                 &vk::StridedDeviceAddressRegionKHR::default(),
                 800,
