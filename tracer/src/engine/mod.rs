@@ -98,15 +98,6 @@ unsafe extern "system" fn vulkan_debug_callback(
     vk::FALSE
 }
 
-enum VulkanObject {
-    Buffer(vk::Buffer),
-    Image(vk::Image),
-}
-
-struct Allocation {
-    object: VulkanObject,
-    allocation: vk_mem::Allocation,
-}
 pub struct Vulkan {
     entry: ash::Entry,
     device: ash::Device,
