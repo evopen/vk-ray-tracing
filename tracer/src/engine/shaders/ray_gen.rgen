@@ -1,5 +1,5 @@
 #version 460
-#extension GL_EXT_ray_tracing : require
+#extension GL_EXT_ray_tracing : enable
 
 layout(binding = 0, set = 0) uniform accelerationStructureEXT top_level_as;
 layout(binding = 1, set = 0, rgba32f) uniform image2D image;
@@ -11,8 +11,8 @@ void main()
     float tmax = 10000.0;
 
     const vec2 uv = vec2(gl_LaunchIDEXT.xy) / vec2(gl_LaunchSizeEXT.xy - 1);
-    const vec3 origin = vec3(0.0, 0.0, 0.0);
-    const vec3 dir = vec3(uv.x, uv.y, -1.0);
+    const vec3 origin = vec3(0.0, 0.0, -2.5);
+    const vec3 dir = vec3(uv.x, uv.y, 1.0);
 
     traceRayEXT(top_level_as, gl_RayFlagsOpaqueEXT, 0xff, 0, 0, 0, origin, tmin, dir, tmax, 0);
 
