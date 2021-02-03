@@ -8,6 +8,10 @@ pub struct Swapchain {
     handle: vk::SwapchainKHR,
     loader: ash::extensions::khr::Swapchain,
     images: Vec<Image>,
+    surface_loader: ash::extensions::khr::Surface,
+    surface: vk::SurfaceKHR,
+    pdevice: vk::PhysicalDevice,
+    device: ash::Device,
 }
 
 impl Swapchain {
@@ -22,6 +26,8 @@ impl Swapchain {
             let surface = surface.clone();
             let pdevice = pdevice.clone();
             let loader = loader.clone();
+            let surface_loader = surface_loader.clone();
+            let device = device.clone();
 
             let surface_capabilities =
                 surface_loader.get_physical_device_surface_capabilities(pdevice, surface)?;
@@ -52,7 +58,7 @@ impl Swapchain {
                 .get_swapchain_images(handle)?
                 .into_iter()
                 .map(|handle| {
-                    Image::from_handle(handle, device, width, height, vk::ImageLayout::UNDEFINED)
+                    Image::from_handle(handle, &device, width, height, vk::ImageLayout::UNDEFINED)
                         .unwrap()
                 })
                 .collect();
@@ -60,6 +66,10 @@ impl Swapchain {
                 handle,
                 loader,
                 images,
+                surface_loader,
+                surface,
+                pdevice,
+                device,
             })
         }
     }
@@ -77,6 +87,54 @@ impl Swapchain {
             Ok(self
                 .loader
                 .acquire_next_image(self.handle, 0, semaphore, vk::Fence::null())?)
+        }
+    }
+
+    pub fn renew(&mut self) -> Result<()> {
+        unsafe {
+            self.loader.destroy_swapchain(self.handle, None);
+            let surface_capabilities = self
+                .surface_loader
+                .get_physical_device_surface_capabilities(self.pdevice, self.surface)?;
+
+            let surface_format = self
+                .surface_loader
+                .get_physical_device_surface_formats(self.pdevice, self.surface)?[0];
+
+            let swapchain_create_info = vk::SwapchainCreateInfoKHR::builder()
+                .surface(self.surface)
+                .min_image_count(2)
+                .image_color_space(surface_format.color_space)
+                .image_format(surface_format.format)
+                .image_extent(surface_capabilities.current_extent)
+                .image_usage(
+                    vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::TRANSFER_DST,
+                )
+                .image_sharing_mode(vk::SharingMode::EXCLUSIVE)
+                .pre_transform(vk::SurfaceTransformFlagsKHR::IDENTITY)
+                .composite_alpha(vk::CompositeAlphaFlagsKHR::OPAQUE)
+                .present_mode(vk::PresentModeKHR::FIFO)
+                .clipped(true)
+                .image_array_layers(1);
+            self.handle = self.loader.create_swapchain(&swapchain_create_info, None)?;
+            let width = surface_capabilities.current_extent.width;
+            let height = surface_capabilities.current_extent.height;
+            self.images = self
+                .loader
+                .get_swapchain_images(self.handle)?
+                .into_iter()
+                .map(|handle| {
+                    Image::from_handle(
+                        handle,
+                        &self.device,
+                        width,
+                        height,
+                        vk::ImageLayout::UNDEFINED,
+                    )
+                    .unwrap()
+                })
+                .collect();
+            Ok(())
         }
     }
 }

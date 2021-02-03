@@ -848,7 +848,16 @@ impl Engine {
         }
     }
 
-    pub fn input(&self, event: &winit::event::WindowEvent) {}
+    pub fn input(&mut self, event: &winit::event::WindowEvent) -> Result<()> {
+        match event {
+            winit::event::WindowEvent::Resized(_) => {
+                self.swapchain.renew()?;
+            }
+            _ => {}
+        }
+
+        Ok(())
+    }
 
     pub fn update(&self) -> Result<()> {
         Ok(())
