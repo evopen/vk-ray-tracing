@@ -701,8 +701,8 @@ impl Engine {
         unsafe {
             let instance = vk::AccelerationStructureInstanceKHR {
                 transform: vk::TransformMatrixKHR { matrix: TRANSFORM },
-                instance_custom_index_and_mask: 0xFF,
-                instance_shader_binding_table_record_offset_and_flags: 0x01,
+                instance_custom_index_and_mask: 0 | (0xFF << 24),
+                instance_shader_binding_table_record_offset_and_flags: 0 | (0x01 << 24),
                 acceleration_structure_reference: vk::AccelerationStructureReferenceKHR {
                     device_handle: self.bottom_as.as_ref().unwrap().device_address(),
                 },
