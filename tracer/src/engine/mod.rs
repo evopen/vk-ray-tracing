@@ -419,26 +419,31 @@ impl Engine {
 
             let vertices_buffer = Buffer::new(
                 std::mem::size_of_val(&VERTICES),
-                vk::BufferUsageFlags::VERTEX_BUFFER | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
+                vk::BufferUsageFlags::ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_KHR
+                    | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
                 vk_mem::MemoryUsage::CpuToGpu,
                 allocator.clone(),
             )?;
+            dbg!(&vertices_buffer.size());
+            vertices_buffer.copy_into(std::mem::transmute(&VERTICES))?;
 
             let indices_buffer = Buffer::new(
                 std::mem::size_of_val(&INDICES),
-                vk::BufferUsageFlags::INDEX_BUFFER | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
+                vk::BufferUsageFlags::ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_KHR
+                    | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
                 vk_mem::MemoryUsage::CpuToGpu,
                 allocator.clone(),
             )?;
-
-            let transform_matrix = glam::Mat4::identity();
+            indices_buffer.copy_into(std::mem::transmute(&INDICES))?;
 
             let transform_buffer = Buffer::new(
-                std::mem::size_of_val(&transform_matrix),
-                vk::BufferUsageFlags::VERTEX_BUFFER | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
+                std::mem::size_of_val(&TRANSFORM),
+                vk::BufferUsageFlags::ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_KHR
+                    | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
                 vk_mem::MemoryUsage::CpuToGpu,
                 allocator.clone(),
             )?;
+            transform_buffer.copy_into(std::mem::transmute(&TRANSFORM))?;
 
             let render_finish_semaphore =
                 device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None)?;
@@ -650,22 +655,26 @@ impl Engine {
 
     fn create_bottom_level_acceleration_structure(&mut self) -> Result<()> {
         let vertex_buffer_device_address = vk::DeviceOrHostAddressConstKHR {
-            device_address: self.get_buffer_device_address(self.vertices_buffer.handle),
+            device_address: self.vertices_buffer.device_address()?,
         };
         let index_buffer_device_address = vk::DeviceOrHostAddressConstKHR {
-            device_address: self.get_buffer_device_address(self.indices_buffer.handle),
+            device_address: self.indices_buffer.device_address()?,
         };
         let transform_buffer_device_address = vk::DeviceOrHostAddressConstKHR {
-            device_address: self.get_buffer_device_address(self.transform_buffer.handle),
+            device_address: self.transform_buffer.device_address()?,
         };
 
         unsafe {
             let geometry = vk::AccelerationStructureGeometryKHR::builder()
                 .geometry_type(vk::GeometryTypeKHR::TRIANGLES)
+                .flags(vk::GeometryFlagsKHR::OPAQUE)
                 .geometry(vk::AccelerationStructureGeometryDataKHR {
                     triangles: vk::AccelerationStructureGeometryTrianglesDataKHR::builder()
                         .vertex_data(vertex_buffer_device_address)
+                        .vertex_format(vk::Format::R32G32B32_SFLOAT)
+                        .vertex_stride(std::mem::size_of::<f32>() as u64 * 3)
                         .index_data(index_buffer_device_address)
+                        .index_type(vk::IndexType::UINT32)
                         .transform_data(transform_buffer_device_address)
                         .max_vertex(3)
                         .build(),
@@ -679,6 +688,7 @@ impl Engine {
                 &self.allocator,
                 &[geometry],
                 vk::AccelerationStructureTypeKHR::BOTTOM_LEVEL,
+                1,
             )?;
 
             self.bottom_as = Some(bottom_as);
@@ -733,6 +743,7 @@ impl Engine {
                 &self.allocator,
                 &[geometry],
                 vk::AccelerationStructureTypeKHR::TOP_LEVEL,
+                1,
             )?;
 
             self.top_as = Some(top_as);

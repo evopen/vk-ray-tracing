@@ -20,6 +20,7 @@ impl AccelerationStructure {
         allocator: &vk_mem::Allocator,
         geometries: &[vk::AccelerationStructureGeometryKHR],
         as_type: vk::AccelerationStructureTypeKHR,
+        primitive_count: u32,
     ) -> Result<Self> {
         unsafe {
             let build_geometry_info = vk::AccelerationStructureBuildGeometryInfoKHR::builder()
@@ -53,7 +54,7 @@ impl AccelerationStructure {
                 size_info.build_scratch_size,
                 vk::BufferUsageFlags::ACCELERATION_STRUCTURE_STORAGE_KHR
                     | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
-                vk_mem::MemoryUsage::CpuToGpu,
+                vk_mem::MemoryUsage::GpuOnly,
                 allocator.clone(),
             )?;
 
@@ -64,10 +65,11 @@ impl AccelerationStructure {
                     device_address: scratch_buffer.device_address()?,
                 });
 
-            dbg!(&build_geometry_info.clone());
-
             let build_range_info = vk::AccelerationStructureBuildRangeInfoKHR::builder()
-                .primitive_count(1)
+                .first_vertex(0)
+                .primitive_offset(0)
+                .transform_offset(0)
+                .primitive_count(primitive_count)
                 .build();
 
             let command_buffer = CommandBuffer::new(&device, pool)?;

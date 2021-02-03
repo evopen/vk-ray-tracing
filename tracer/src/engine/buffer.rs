@@ -11,6 +11,7 @@ pub struct Buffer {
     allocator: ManuallyDrop<vk_mem::Allocator>,
     mapped: bool,
     device_address: Option<vk::DeviceAddress>,
+    size: usize,
 }
 
 impl Buffer {
@@ -54,6 +55,7 @@ impl Buffer {
                 allocator: ManuallyDrop::new(allocator),
                 mapped: false,
                 device_address,
+                size: size.to_usize().unwrap(),
             })
         }
     }
@@ -72,6 +74,19 @@ impl Buffer {
         Ok(self
             .device_address
             .context("buffer does not support device addressing")?)
+    }
+
+    pub fn copy_into(&self, ptr: *const u8) -> Result<()> {
+        let mapped = self.allocator.map_memory(&self.allocation)?;
+        unsafe {
+            std::ptr::copy_nonoverlapping(ptr, mapped, self.size);
+        }
+        self.allocator.unmap_memory(&self.allocation);
+        Ok(())
+    }
+
+    pub fn size(&self) -> usize {
+        self.size
     }
 }
 
