@@ -11,6 +11,7 @@ use acceleration_structure::AccelerationStructure;
 use buffer::Buffer;
 use command_buffer::CommandBuffer;
 use image::Image;
+use khr::Surface;
 use queue::Queue;
 use shaders::Shaders;
 
@@ -24,6 +25,7 @@ use std::{
     io::Write,
     mem::size_of_val,
     path::Path,
+    rc::Rc,
     sync::Arc,
     time::Duration,
 };
@@ -32,12 +34,12 @@ use bytemuck::{Pod, Zeroable};
 
 use anyhow::{bail, Context, Result};
 
+use ash::vk;
 use ash::{
     extensions::ext,
     extensions::khr,
     version::{DeviceV1_0, DeviceV1_2, EntryV1_0, InstanceV1_0, InstanceV1_1, InstanceV1_2},
 };
-use ash::{vk, Device, Entry, Instance};
 use bytemuck::cast_slice;
 use log::{debug, info};
 use vk::{
@@ -105,20 +107,26 @@ struct Allocation {
     object: VulkanObject,
     allocation: vk_mem::Allocation,
 }
+pub struct Vulkan {
+    entry: ash::Entry,
+    device: ash::Device,
+    surface_loader: ash::extensions::khr::Surface,
+    swapchain_loader: ash::extensions::khr::Swapchain,
+    ray_tracing_pipeline_loader: ash::extensions::khr::RayTracingPipeline,
+    acceleration_structure_loader: ash::extensions::khr::AccelerationStructure,
+    physical_device: vk::PhysicalDevice,
+    command_pool: vk::CommandPool,
+    surface: vk::SurfaceKHR,
+    allocator: vk_mem::Allocator,
+}
 
 pub struct Engine {
     size: winit::dpi::PhysicalSize<u32>,
-    entry: Entry,
-    device: Device,
-    instance: Instance,
     vertices_buffer: Buffer,
     indices_buffer: Buffer,
     transform_buffer: Buffer,
-    ray_tracing_pipeline_loader: khr::RayTracingPipeline,
     ray_tracing_pipeline: vk::Pipeline,
-    acceleration_structure_loader: khr::AccelerationStructure,
     command_pool: vk::CommandPool,
-    queue: Queue,
     ray_gen_sbt_buffer: Option<Buffer>,
     hit_sbt_buffer: Option<Buffer>,
     miss_sbt_buffer: Option<Buffer>,
@@ -126,7 +134,6 @@ pub struct Engine {
     descriptor_set_layout: Option<vk::DescriptorSetLayout>,
     descriptor_set: Option<vk::DescriptorSet>,
     pipeline_layout: Option<vk::PipelineLayout>,
-    swapchain_loader: khr::Swapchain,
     swapchain: Swapchain,
     storage_image: Option<Image>,
     image_layout_keeper: BTreeMap<vk::Image, vk::ImageLayout>,
@@ -137,14 +144,15 @@ pub struct Engine {
     instance_buffer: Option<Buffer>,
     bottom_as: Option<AccelerationStructure>,
     top_as: Option<AccelerationStructure>,
-    allocator: vk_mem::Allocator,
+    vulkan: Arc<Vulkan>,
+    queue: Queue,
 }
 
 impl Engine {
     pub fn new(window: &winit::window::Window) -> Result<Self> {
         let size = window.inner_size();
         unsafe {
-            let entry = Entry::new()?;
+            let entry = ash::Entry::new()?;
             match entry.try_enumerate_instance_version()? {
                 // Vulkan 1.1+
                 Some(version) => {
@@ -183,9 +191,7 @@ impl Engine {
                 .enabled_layer_names(&layers_names_raw)
                 .enabled_extension_names(&extension_names_raw);
 
-            let instance: Instance = entry
-                .create_instance(&create_info, None)
-                .expect("Instance creation error");
+            let instance: ash::Instance = entry.create_instance(&create_info, None)?;
 
             let debug_info = vk::DebugUtilsMessengerCreateInfoEXT::builder()
                 .message_severity(
@@ -283,44 +289,13 @@ impl Engine {
                 .push_next(&mut enabled_acceleration_structure_features)
                 .build();
 
-            let device: Device = instance
-                .create_device(pdevice, &device_create_info, None)
-                .unwrap();
-
-            let queue = Queue::new(&device, queue_family_index as u32, 0)?;
+            let device: ash::Device = instance.create_device(pdevice, &device_create_info, None)?;
+            let ray_tracing_pipeline_loader = khr::RayTracingPipeline::new(&instance, &device);
+            let acceleration_structure_loader = khr::AccelerationStructure::new(&instance, &device);
 
             let swapchain_loader = khr::Swapchain::new(&instance, &device);
 
-            let swapchain = Swapchain::new(
-                &swapchain_loader,
-                &surface_loader,
-                &surface,
-                &pdevice,
-                &device,
-            )?;
-
-            let pool_create_info = vk::CommandPoolCreateInfo::builder()
-                .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER)
-                .queue_family_index(queue_family_index);
-
-            let command_pool = device.create_command_pool(&pool_create_info, None)?;
-
-            let command_buffer_allocate_info = vk::CommandBufferAllocateInfo::builder()
-                .command_buffer_count(2)
-                .command_pool(command_pool)
-                .level(vk::CommandBufferLevel::PRIMARY);
-
-            let command_buffers = device.allocate_command_buffers(&command_buffer_allocate_info)?;
-            let setup_command_buffer = command_buffers[0];
-            let draw_command_buffer = command_buffers[1];
-
-            let mut image_layout_keeper = BTreeMap::new();
-
-            let device_memory_properties = instance.get_physical_device_memory_properties(pdevice);
-
-            let ray_tracing_pipeline = khr::RayTracingPipeline::new(&instance, &device);
-            let acceleration_structure_loader = khr::AccelerationStructure::new(&instance, &device);
-            let mut allocator = vk_mem::Allocator::new(&vk_mem::AllocatorCreateInfo {
+            let allocator = vk_mem::Allocator::new(&vk_mem::AllocatorCreateInfo {
                 physical_device: pdevice.clone(),
                 device: device.clone(),
                 instance: instance.clone(),
@@ -328,7 +303,38 @@ impl Engine {
                 ..Default::default()
             })?;
 
-            let descriptor_pool = device.create_descriptor_pool(
+            let pool_create_info = vk::CommandPoolCreateInfo::builder()
+                .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER)
+                .queue_family_index(queue_family_index);
+            let command_pool = device.create_command_pool(&pool_create_info, None)?;
+
+            let vulkan = Arc::new(Vulkan {
+                entry,
+                device,
+                surface_loader,
+                swapchain_loader,
+                ray_tracing_pipeline_loader,
+                acceleration_structure_loader,
+                physical_device: pdevice,
+                command_pool,
+                surface,
+                allocator,
+            });
+
+            let queue = Queue::new(vulkan.clone(), queue_family_index as u32, 0)?;
+
+            let swapchain = Swapchain::new(vulkan.clone())?;
+
+            let command_buffer_allocate_info = vk::CommandBufferAllocateInfo::builder()
+                .command_buffer_count(2)
+                .command_pool(command_pool)
+                .level(vk::CommandBufferLevel::PRIMARY);
+
+            let mut image_layout_keeper = BTreeMap::new();
+
+            let device_memory_properties = instance.get_physical_device_memory_properties(pdevice);
+
+            let descriptor_pool = vulkan.device.create_descriptor_pool(
                 &vk::DescriptorPoolCreateInfo::builder()
                     .pool_sizes(&[
                         vk::DescriptorPoolSize::builder()
@@ -349,7 +355,7 @@ impl Engine {
                 vk::BufferUsageFlags::ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_KHR
                     | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
                 vk_mem::MemoryUsage::CpuToGpu,
-                allocator.clone(),
+                vulkan.clone(),
             )?;
             vertices_buffer.copy_into(std::mem::transmute(&VERTICES))?;
 
@@ -358,7 +364,7 @@ impl Engine {
                 vk::BufferUsageFlags::ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_KHR
                     | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
                 vk_mem::MemoryUsage::CpuToGpu,
-                allocator.clone(),
+                vulkan.clone(),
             )?;
             indices_buffer.copy_into(std::mem::transmute(&INDICES))?;
 
@@ -367,15 +373,17 @@ impl Engine {
                 vk::BufferUsageFlags::ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_KHR
                     | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
                 vk_mem::MemoryUsage::CpuToGpu,
-                allocator.clone(),
+                vulkan.clone(),
             )?;
             transform_buffer.copy_into(std::mem::transmute(&TRANSFORM))?;
 
-            let render_finish_semaphore =
-                device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None)?;
-            let image_available_semaphore =
-                device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None)?;
-            let render_finish_fence = Arc::new(Box::new(Fence::new(&device, true)?));
+            let render_finish_semaphore = vulkan
+                .device
+                .create_semaphore(&vk::SemaphoreCreateInfo::default(), None)?;
+            let image_available_semaphore = vulkan
+                .device
+                .create_semaphore(&vk::SemaphoreCreateInfo::default(), None)?;
+            let render_finish_fence = Arc::new(Box::new(Fence::new(true, vulkan.clone())?));
 
             let mut ray_tracing_pipeline_properties =
                 vk::PhysicalDeviceRayTracingPipelinePropertiesKHR::default();
@@ -389,26 +397,18 @@ impl Engine {
             Ok(Self {
                 ray_tracing_pipeline_properties,
                 size,
-                entry,
-                allocator,
-                device,
-                instance,
                 command_pool,
                 vertices_buffer,
                 indices_buffer,
                 transform_buffer,
-                queue,
                 ray_gen_sbt_buffer: None,
                 hit_sbt_buffer: None,
-                ray_tracing_pipeline_loader: ray_tracing_pipeline,
-                acceleration_structure_loader,
                 ray_tracing_pipeline: vk::Pipeline::null(),
                 miss_sbt_buffer: None,
                 descriptor_pool,
                 descriptor_set_layout: None,
                 descriptor_set: None,
                 pipeline_layout: None,
-                swapchain_loader,
                 swapchain,
                 top_as: None,
                 storage_image: None,
@@ -418,6 +418,8 @@ impl Engine {
                 render_finish_fence,
                 instance_buffer: None,
                 bottom_as: None,
+                vulkan,
+                queue,
             })
         }
     }
@@ -452,11 +454,10 @@ impl Engine {
                 vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::STORAGE,
                 MemoryUsage::GpuOnly,
                 vk::ImageLayout::UNDEFINED,
-                &self.allocator,
-                &self.device,
+                self.vulkan.clone(),
             )?;
 
-            let command_buffer = CommandBuffer::new(&self.device, self.command_pool)?;
+            let command_buffer = CommandBuffer::new(&self.vulkan.device, self.command_pool)?;
             command_buffer.encode(|buf| {
                 image.cmd_set_layout(buf, vk::ImageLayout::GENERAL)?;
                 Ok(())
@@ -474,7 +475,8 @@ impl Engine {
     fn create_descriptor_set(&mut self) -> Result<()> {
         unsafe {
             self.descriptor_set = Some(
-                self.device
+                self.vulkan
+                    .device
                     .allocate_descriptor_sets(
                         &vk::DescriptorSetAllocateInfo::builder()
                             .descriptor_pool(self.descriptor_pool)
@@ -486,7 +488,7 @@ impl Engine {
             );
             debug!("descriptor set allocated");
 
-            self.device.update_descriptor_sets(
+            self.vulkan.device.update_descriptor_sets(
                 &[
                     std::iter::once(
                         vk::WriteDescriptorSet::builder()
@@ -555,14 +557,11 @@ impl Engine {
                 })
                 .build();
             let bottom_as = AccelerationStructure::new(
-                &self.device,
-                self.command_pool,
-                &self.queue,
-                &self.acceleration_structure_loader,
-                &self.allocator,
                 &[geometry],
                 vk::AccelerationStructureTypeKHR::BOTTOM_LEVEL,
                 1,
+                self.vulkan.clone(),
+                &self.queue,
             )?;
 
             self.bottom_as = Some(bottom_as);
@@ -586,7 +585,7 @@ impl Engine {
                 vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS
                     | vk::BufferUsageFlags::ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_KHR,
                 vk_mem::MemoryUsage::CpuToGpu,
-                self.allocator.clone(),
+                self.vulkan.clone(),
             )?;
 
             let mapped = instance_buffer.map()?;
@@ -610,14 +609,11 @@ impl Engine {
                 .build();
 
             let top_as = AccelerationStructure::new(
-                &self.device,
-                self.command_pool,
-                &self.queue,
-                &self.acceleration_structure_loader,
-                &self.allocator,
                 &[geometry],
                 vk::AccelerationStructureTypeKHR::TOP_LEVEL,
                 1,
+                self.vulkan.clone(),
+                &self.queue,
             )?;
 
             self.top_as = Some(top_as);
@@ -628,7 +624,7 @@ impl Engine {
 
     fn create_ray_tracing_pipeline(&mut self) -> Result<()> {
         unsafe {
-            let descriptor_set_layout = self.device.create_descriptor_set_layout(
+            let descriptor_set_layout = self.vulkan.device.create_descriptor_set_layout(
                 &vk::DescriptorSetLayoutCreateInfo::builder()
                     .bindings(&[
                         vk::DescriptorSetLayoutBinding::builder()
@@ -649,7 +645,7 @@ impl Engine {
             )?;
             self.descriptor_set_layout = Some(descriptor_set_layout);
             self.pipeline_layout = Some(
-                self.device.create_pipeline_layout(
+                self.vulkan.device.create_pipeline_layout(
                     &vk::PipelineLayoutCreateInfo::builder()
                         .set_layouts(&[descriptor_set_layout])
                         .build(),
@@ -658,6 +654,7 @@ impl Engine {
             );
 
             self.ray_tracing_pipeline = self
+                .vulkan
                 .ray_tracing_pipeline_loader
                 .create_ray_tracing_pipelines(
                     vk::DeferredOperationKHR::null(),
@@ -731,7 +728,7 @@ impl Engine {
             .code(bytemuck::cast_slice(raw_bytes))
             .build();
 
-        unsafe { Ok(self.device.create_shader_module(&info, None)?) }
+        unsafe { Ok(self.vulkan.device.create_shader_module(&info, None)?) }
     }
 
     fn create_acceleration_structure_buffer(
@@ -743,7 +740,7 @@ impl Engine {
             vk::BufferUsageFlags::ACCELERATION_STRUCTURE_STORAGE_KHR
                 | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
             vk_mem::MemoryUsage::CpuToGpu,
-            self.allocator.clone(),
+            self.vulkan.clone(),
         )?;
 
         Ok(buffer)
@@ -751,7 +748,7 @@ impl Engine {
 
     fn get_buffer_device_address(&self, buffer: vk::Buffer) -> u64 {
         unsafe {
-            self.device.get_buffer_device_address(
+            self.vulkan.device.get_buffer_device_address(
                 &vk::BufferDeviceAddressInfo::builder()
                     .buffer(buffer)
                     .build(),
@@ -768,6 +765,7 @@ impl Engine {
                 .ray_tracing_pipeline_properties
                 .shader_group_handle_alignment as usize;
             let handle = self
+                .vulkan
                 .ray_tracing_pipeline_loader
                 .get_ray_tracing_shader_group_handles(
                     self.ray_tracing_pipeline,
@@ -780,7 +778,7 @@ impl Engine {
                 vk::BufferUsageFlags::SHADER_BINDING_TABLE_KHR
                     | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
                 MemoryUsage::CpuToGpu,
-                self.allocator.clone(),
+                self.vulkan.clone(),
             )?;
 
             let mapped = buffer.map()?;
@@ -793,7 +791,7 @@ impl Engine {
                 vk::BufferUsageFlags::SHADER_BINDING_TABLE_KHR
                     | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
                 MemoryUsage::CpuToGpu,
-                self.allocator.clone(),
+                self.vulkan.clone(),
             )?;
             let mapped = buffer.map()?;
             std::ptr::copy_nonoverlapping(
@@ -809,7 +807,7 @@ impl Engine {
                 vk::BufferUsageFlags::SHADER_BINDING_TABLE_KHR
                     | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
                 MemoryUsage::CpuToGpu,
-                self.allocator.clone(),
+                self.vulkan.clone(),
             )?;
             let mapped = buffer.map()?;
             std::ptr::copy_nonoverlapping(
@@ -848,19 +846,19 @@ impl Engine {
                 .ray_tracing_pipeline_properties
                 .shader_group_handle_alignment as u64;
 
-            let command_buffer = CommandBuffer::new(&self.device, self.command_pool)?;
+            let command_buffer = CommandBuffer::new(&self.vulkan.device, self.command_pool)?;
 
-            self.device.begin_command_buffer(
+            self.vulkan.device.begin_command_buffer(
                 command_buffer.handle(),
                 &vk::CommandBufferBeginInfo::default(),
             )?;
 
-            self.device.cmd_bind_pipeline(
+            self.vulkan.device.cmd_bind_pipeline(
                 command_buffer.handle(),
                 vk::PipelineBindPoint::RAY_TRACING_KHR,
                 self.ray_tracing_pipeline,
             );
-            self.device.cmd_bind_descriptor_sets(
+            self.vulkan.device.cmd_bind_descriptor_sets(
                 command_buffer.handle(),
                 vk::PipelineBindPoint::RAY_TRACING_KHR,
                 self.pipeline_layout.unwrap(),
@@ -869,7 +867,7 @@ impl Engine {
                 &[],
             );
 
-            self.ray_tracing_pipeline_loader.cmd_trace_rays(
+            self.vulkan.ray_tracing_pipeline_loader.cmd_trace_rays(
                 command_buffer.handle(),
                 &vk::StridedDeviceAddressRegionKHR::builder()
                     .device_address(self.ray_gen_sbt_buffer.as_ref().unwrap().device_address()?)
@@ -901,7 +899,7 @@ impl Engine {
                 vk::ImageLayout::TRANSFER_DST_OPTIMAL,
             )?;
 
-            self.device.cmd_copy_image(
+            self.vulkan.device.cmd_copy_image(
                 command_buffer.handle(),
                 self.storage_image.as_ref().unwrap().handle(),
                 vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
@@ -938,7 +936,9 @@ impl Engine {
                 .as_mut()
                 .unwrap()
                 .cmd_set_layout(command_buffer.handle(), vk::ImageLayout::GENERAL);
-            self.device.end_command_buffer(command_buffer.handle())?;
+            self.vulkan
+                .device
+                .end_command_buffer(command_buffer.handle())?;
 
             debug!("record complete");
             self.render_finish_fence.wait();
@@ -952,7 +952,7 @@ impl Engine {
             )?;
 
             debug!("command submitted");
-            self.swapchain_loader.queue_present(
+            self.vulkan.swapchain_loader.queue_present(
                 self.queue.handle(),
                 &vk::PresentInfoKHR::builder()
                     .swapchains(&[self.swapchain.handle()])

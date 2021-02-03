@@ -1,17 +1,19 @@
-use std::mem::ManuallyDrop;
+use std::{mem::ManuallyDrop, rc::Rc, sync::Arc};
 
 use anyhow::{Context, Result};
 use ash::{version::DeviceV1_2, vk};
 use log::debug;
 use vk_mem::AllocationCreateInfo;
 
+use super::Vulkan;
+
 pub struct Buffer {
     pub handle: vk::Buffer,
     allocation: vk_mem::Allocation,
-    allocator: ManuallyDrop<vk_mem::Allocator>,
     mapped: bool,
     device_address: Option<vk::DeviceAddress>,
     size: usize,
+    vulkan: Arc<Vulkan>,
 }
 
 impl Buffer {
@@ -19,12 +21,12 @@ impl Buffer {
         size: I,
         buffer_usage: vk::BufferUsageFlags,
         memory_usage: vk_mem::MemoryUsage,
-        allocator: vk_mem::Allocator,
+        vulkan: Arc<Vulkan>,
     ) -> Result<Self>
     where
         I: num_traits::PrimInt,
     {
-        let (handle, allocation, _) = allocator.create_buffer(
+        let (handle, allocation, _) = vulkan.allocator.create_buffer(
             &vk::BufferCreateInfo::builder()
                 .usage(buffer_usage)
                 .size(size.to_u64().context("failed to convert to u64")?)
@@ -40,7 +42,7 @@ impl Buffer {
                 != vk::BufferUsageFlags::empty()
             {
                 true => Some(
-                    allocator.device.get_buffer_device_address(
+                    vulkan.device.get_buffer_device_address(
                         &vk::BufferDeviceAddressInfo::builder()
                             .buffer(handle)
                             .build(),
@@ -52,22 +54,22 @@ impl Buffer {
             Ok(Self {
                 handle,
                 allocation,
-                allocator: ManuallyDrop::new(allocator),
                 mapped: false,
                 device_address,
                 size: size.to_usize().unwrap(),
+                vulkan,
             })
         }
     }
 
     pub fn map(&mut self) -> Result<*mut u8> {
         self.mapped = true;
-        Ok(self.allocator.map_memory(&self.allocation)?)
+        Ok(self.vulkan.allocator.map_memory(&self.allocation)?)
     }
 
     pub fn unmap(&mut self) {
         self.mapped = false;
-        self.allocator.unmap_memory(&self.allocation)
+        self.vulkan.allocator.unmap_memory(&self.allocation)
     }
 
     pub fn device_address(&self) -> Result<vk::DeviceAddress> {
@@ -77,11 +79,11 @@ impl Buffer {
     }
 
     pub fn copy_into(&self, ptr: *const u8) -> Result<()> {
-        let mapped = self.allocator.map_memory(&self.allocation)?;
+        let mapped = self.vulkan.allocator.map_memory(&self.allocation)?;
         unsafe {
             std::ptr::copy_nonoverlapping(ptr, mapped, self.size);
         }
-        self.allocator.unmap_memory(&self.allocation);
+        self.vulkan.allocator.unmap_memory(&self.allocation);
         Ok(())
     }
 
@@ -95,6 +97,8 @@ impl Drop for Buffer {
         if self.mapped {
             self.unmap();
         }
-        self.allocator.destroy_buffer(self.handle, &self.allocation);
+        self.vulkan
+            .allocator
+            .destroy_buffer(self.handle, &self.allocation);
     }
 }

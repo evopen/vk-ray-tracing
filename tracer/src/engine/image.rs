@@ -1,13 +1,12 @@
 use anyhow::{bail, Result};
-use std::mem::ManuallyDrop;
+use std::{mem::ManuallyDrop, rc::Rc, sync::Arc};
 
 use ash::{version::DeviceV1_0, vk};
 
+use super::Vulkan;
+
 enum ImageType {
-    Allocated {
-        allocator: ManuallyDrop<vk_mem::Allocator>,
-        allocation: vk_mem::Allocation,
-    },
+    Allocated(vk_mem::Allocation),
     Swapchain,
 }
 
@@ -18,7 +17,7 @@ pub struct Image {
     width: u32,
     height: u32,
     layout: vk::ImageLayout,
-    device: ash::Device,
+    vulkan: Arc<Vulkan>,
 }
 
 impl Image {
@@ -28,11 +27,10 @@ impl Image {
         image_usage: vk::ImageUsageFlags,
         memory_usage: vk_mem::MemoryUsage,
         initial_layout: vk::ImageLayout,
-        allocator: &vk_mem::Allocator,
-        device: &ash::Device,
+        vulkan: Arc<Vulkan>,
     ) -> Result<Self> {
         unsafe {
-            let (handle, allocation, _) = allocator.create_image(
+            let (handle, allocation, _) = vulkan.allocator.create_image(
                 &vk::ImageCreateInfo::builder()
                     .image_type(vk::ImageType::TYPE_2D)
                     .format(vk::Format::B8G8R8A8_UNORM)
@@ -54,7 +52,7 @@ impl Image {
                     ..Default::default()
                 },
             )?;
-            let view = device.create_image_view(
+            let view = vulkan.device.create_image_view(
                 &vk::ImageViewCreateInfo::builder()
                     .view_type(vk::ImageViewType::TYPE_2D)
                     .format(vk::Format::B8G8R8A8_UNORM)
@@ -72,34 +70,30 @@ impl Image {
                 None,
             )?;
 
-            let allocator = ManuallyDrop::new(allocator.clone());
+            let image_type = ImageType::Allocated(allocation);
 
-            let image_type = ImageType::Allocated {
-                allocator,
-                allocation,
-            };
             Ok(Self {
                 handle,
                 view,
                 width,
                 height,
                 layout: initial_layout,
-                device: device.clone(),
                 image_type,
+                vulkan,
             })
         }
     }
 
     pub fn from_handle(
         handle: vk::Image,
-        device: &ash::Device,
         width: u32,
         height: u32,
         layout: vk::ImageLayout,
+        vulkan: Arc<Vulkan>,
     ) -> Result<Self> {
         unsafe {
             let image_type = ImageType::Swapchain;
-            let view = device.create_image_view(
+            let view = vulkan.device.create_image_view(
                 &vk::ImageViewCreateInfo::builder()
                     .view_type(vk::ImageViewType::TYPE_2D)
                     .format(vk::Format::B8G8R8A8_UNORM)
@@ -122,8 +116,8 @@ impl Image {
                 width,
                 height,
                 layout,
-                device: device.clone(),
                 image_type,
+                vulkan,
             })
         }
     }
@@ -146,7 +140,7 @@ impl Image {
             command_buffer,
             self.handle,
             layout,
-            &self.device,
+            &self.vulkan.device,
         )?;
         self.layout = layout;
         Ok(())
@@ -156,11 +150,10 @@ impl Image {
 impl Drop for Image {
     fn drop(&mut self) {
         match &self.image_type {
-            ImageType::Allocated {
-                allocator,
-                allocation,
-            } => unsafe {
-                allocator.destroy_image(self.handle, &allocation);
+            ImageType::Allocated(allocation) => unsafe {
+                self.vulkan
+                    .allocator
+                    .destroy_image(self.handle, &allocation);
             },
             ImageType::Swapchain => {}
         }

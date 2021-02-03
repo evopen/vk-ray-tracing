@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{rc::Rc, sync::Arc};
 
 use anyhow::Result;
 use ash::{
@@ -7,23 +7,22 @@ use ash::{
 };
 use log::debug;
 
-use super::command_buffer::CommandBuffer;
+use super::{command_buffer::CommandBuffer, Vulkan};
 
 pub struct Queue {
     handle: vk::Queue,
-    device: ash::Device,
+    vulkan: Arc<Vulkan>,
 }
 
 pub struct Fence {
     handle: vk::Fence,
-    device: ash::Device,
+    vulkan: Arc<Vulkan>,
 }
 
 impl Fence {
-    pub fn new(device: &ash::Device, signaled: bool) -> Result<Self> {
+    pub fn new(signaled: bool, vulkan: Arc<Vulkan>) -> Result<Self> {
         unsafe {
-            let device = device.clone();
-            let handle = device.create_fence(
+            let handle = vulkan.device.create_fence(
                 &vk::FenceCreateInfo::builder()
                     .flags(match signaled {
                         true => vk::FenceCreateFlags::SIGNALED,
@@ -32,13 +31,14 @@ impl Fence {
                     .build(),
                 None,
             )?;
-            Ok(Self { handle, device })
+            Ok(Self { handle, vulkan })
         }
     }
 
     pub fn wait(&self) -> Result<()> {
         unsafe {
-            self.device
+            self.vulkan
+                .device
                 .wait_for_fences(&[self.handle], true, std::u64::MAX)?;
             Ok(())
         }
@@ -46,7 +46,7 @@ impl Fence {
 
     pub fn reset(&self) -> Result<()> {
         unsafe {
-            self.device.reset_fences(&[self.handle])?;
+            self.vulkan.device.reset_fences(&[self.handle])?;
             Ok(())
         }
     }
@@ -59,7 +59,7 @@ impl Fence {
 impl Drop for Fence {
     fn drop(&mut self) {
         self.wait().unwrap();
-        unsafe { self.device.destroy_fence(self.handle, None) }
+        unsafe { self.vulkan.device.destroy_fence(self.handle, None) }
     }
 }
 
@@ -153,11 +153,12 @@ impl Drop for BinarySemaphore {
 }
 
 impl Queue {
-    pub fn new(device: &ash::Device, queue_family_index: u32, queue_index: u32) -> Result<Self> {
+    pub fn new(vulkan: Arc<Vulkan>, queue_family_index: u32, queue_index: u32) -> Result<Self> {
         unsafe {
-            let device = device.clone();
-            let handle = device.get_device_queue(queue_family_index, queue_index);
-            Ok(Self { handle, device })
+            let handle = vulkan
+                .device
+                .get_device_queue(queue_family_index, queue_index);
+            Ok(Self { handle, vulkan })
         }
     }
 
@@ -188,11 +189,11 @@ impl Queue {
                 )
                 .build();
 
-            let fence = Fence::new(&self.device, false)?;
-            self.device
+            let fence = Fence::new(false, self.vulkan.clone())?;
+            self.vulkan
+                .device
                 .queue_submit(self.handle, &[submit_info], fence.handle)?;
 
-            let device = self.device.clone();
             tokio::task::spawn(async move {
                 fence.wait().unwrap();
                 drop(command_buffer);
@@ -209,7 +210,7 @@ impl Queue {
         signal_semaphores: &[vk::Semaphore],
     ) -> Result<Arc<Box<Fence>>> {
         unsafe {
-            let fence = Arc::new(Box::new(Fence::new(&self.device, false)?));
+            let fence = Arc::new(Box::new(Fence::new(false, self.vulkan.clone())?));
 
             let mut submit_info = vk::SubmitInfo::builder()
                 .command_buffers(&[command_buffer.handle()])
@@ -218,9 +219,10 @@ impl Queue {
                 .signal_semaphores(signal_semaphores)
                 .build();
 
-            self.device
+            self.vulkan
+                .device
                 .queue_submit(self.handle, &[submit_info], fence.handle)?;
-            let device = self.device.clone();
+            let device = self.vulkan.device.clone();
             let handle = fence.handle;
             let cmd_buffer_freer = fence.clone();
             tokio::task::spawn(async move {

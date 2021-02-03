@@ -1,43 +1,31 @@
+use std::{rc::Rc, sync::Arc};
+
 use ash::{extensions, vk};
 
 use anyhow::Result;
 
-use super::image::Image;
+use super::{image::Image, Vulkan};
 
 pub struct Swapchain {
     handle: vk::SwapchainKHR,
-    loader: ash::extensions::khr::Swapchain,
     images: Vec<Image>,
-    surface_loader: ash::extensions::khr::Surface,
-    surface: vk::SurfaceKHR,
-    pdevice: vk::PhysicalDevice,
-    device: ash::Device,
+    vulkan: Arc<Vulkan>,
 }
 
 impl Swapchain {
-    pub fn new(
-        loader: &ash::extensions::khr::Swapchain,
-        surface_loader: &ash::extensions::khr::Surface,
-        surface: &vk::SurfaceKHR,
-        pdevice: &vk::PhysicalDevice,
-        device: &ash::Device,
-    ) -> Result<Self> {
+    pub fn new(vulkan: Arc<Vulkan>) -> Result<Self> {
         unsafe {
-            let surface = surface.clone();
-            let pdevice = pdevice.clone();
-            let loader = loader.clone();
-            let surface_loader = surface_loader.clone();
-            let device = device.clone();
+            let surface_capabilities = vulkan
+                .surface_loader
+                .get_physical_device_surface_capabilities(vulkan.physical_device, vulkan.surface)?;
 
-            let surface_capabilities =
-                surface_loader.get_physical_device_surface_capabilities(pdevice, surface)?;
-
-            let surface_format = surface_loader
-                .get_physical_device_surface_formats(pdevice, surface)
+            let surface_format = vulkan
+                .surface_loader
+                .get_physical_device_surface_formats(vulkan.physical_device, vulkan.surface)
                 .unwrap()[0];
 
             let swapchain_create_info = vk::SwapchainCreateInfoKHR::builder()
-                .surface(surface)
+                .surface(vulkan.surface)
                 .min_image_count(2)
                 .image_color_space(surface_format.color_space)
                 .image_format(surface_format.format)
@@ -51,25 +39,30 @@ impl Swapchain {
                 .present_mode(vk::PresentModeKHR::FIFO)
                 .clipped(true)
                 .image_array_layers(1);
-            let handle = loader.create_swapchain(&swapchain_create_info, None)?;
+            let handle = vulkan
+                .swapchain_loader
+                .create_swapchain(&swapchain_create_info, None)?;
             let width = surface_capabilities.current_extent.width;
             let height = surface_capabilities.current_extent.height;
-            let images = loader
+            let images = vulkan
+                .swapchain_loader
                 .get_swapchain_images(handle)?
                 .into_iter()
                 .map(|handle| {
-                    Image::from_handle(handle, &device, width, height, vk::ImageLayout::UNDEFINED)
-                        .unwrap()
+                    Image::from_handle(
+                        handle,
+                        width,
+                        height,
+                        vk::ImageLayout::UNDEFINED,
+                        vulkan.clone(),
+                    )
+                    .unwrap()
                 })
                 .collect();
             Ok(Self {
                 handle,
-                loader,
                 images,
-                surface_loader,
-                surface,
-                pdevice,
-                device,
+                vulkan,
             })
         }
     }
@@ -84,25 +77,38 @@ impl Swapchain {
 
     pub fn acquire_next_image(&self, semaphore: vk::Semaphore) -> Result<(u32, bool)> {
         unsafe {
-            Ok(self
-                .loader
-                .acquire_next_image(self.handle, 0, semaphore, vk::Fence::null())?)
+            Ok(self.vulkan.swapchain_loader.acquire_next_image(
+                self.handle,
+                0,
+                semaphore,
+                vk::Fence::null(),
+            )?)
         }
     }
 
     pub fn renew(&mut self) -> Result<()> {
         unsafe {
-            self.loader.destroy_swapchain(self.handle, None);
+            self.vulkan
+                .swapchain_loader
+                .destroy_swapchain(self.handle, None);
             let surface_capabilities = self
+                .vulkan
                 .surface_loader
-                .get_physical_device_surface_capabilities(self.pdevice, self.surface)?;
+                .get_physical_device_surface_capabilities(
+                    self.vulkan.physical_device,
+                    self.vulkan.surface,
+                )?;
 
             let surface_format = self
+                .vulkan
                 .surface_loader
-                .get_physical_device_surface_formats(self.pdevice, self.surface)?[0];
+                .get_physical_device_surface_formats(
+                    self.vulkan.physical_device,
+                    self.vulkan.surface,
+                )?[0];
 
             let swapchain_create_info = vk::SwapchainCreateInfoKHR::builder()
-                .surface(self.surface)
+                .surface(self.vulkan.surface)
                 .min_image_count(2)
                 .image_color_space(surface_format.color_space)
                 .image_format(surface_format.format)
@@ -116,20 +122,24 @@ impl Swapchain {
                 .present_mode(vk::PresentModeKHR::FIFO)
                 .clipped(true)
                 .image_array_layers(1);
-            self.handle = self.loader.create_swapchain(&swapchain_create_info, None)?;
+            self.handle = self
+                .vulkan
+                .swapchain_loader
+                .create_swapchain(&swapchain_create_info, None)?;
             let width = surface_capabilities.current_extent.width;
             let height = surface_capabilities.current_extent.height;
             self.images = self
-                .loader
+                .vulkan
+                .swapchain_loader
                 .get_swapchain_images(self.handle)?
                 .into_iter()
                 .map(|handle| {
                     Image::from_handle(
                         handle,
-                        &self.device,
                         width,
                         height,
                         vk::ImageLayout::UNDEFINED,
+                        self.vulkan.clone(),
                     )
                     .unwrap()
                 })
@@ -141,6 +151,10 @@ impl Swapchain {
 
 impl Drop for Swapchain {
     fn drop(&mut self) {
-        unsafe { self.loader.destroy_swapchain(self.handle, None) }
+        unsafe {
+            self.vulkan
+                .swapchain_loader
+                .destroy_swapchain(self.handle, None)
+        }
     }
 }
