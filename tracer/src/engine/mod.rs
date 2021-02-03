@@ -1,5 +1,6 @@
 mod acceleration_structure;
 mod buffer;
+mod camera;
 mod command_buffer;
 mod image;
 mod queue;
