@@ -37,11 +37,12 @@ impl CommandBuffer {
 
     pub fn encode<F>(&self, func: F) -> Result<()>
     where
-        F: FnOnce(vk::CommandBuffer),
+        F: FnOnce(vk::CommandBuffer) -> Result<()>,
     {
         unsafe {
             self.device
                 .begin_command_buffer(self.handle, &vk::CommandBufferBeginInfo::default())?;
+            func(self.handle);
             self.device.end_command_buffer(self.handle)?;
             Ok(())
         }

@@ -481,9 +481,11 @@ impl Engine {
             )?;
 
             let command_buffer = CommandBuffer::new(&self.device, self.command_pool)?;
-            command_buffer.begin()?;
-            image.cmd_set_layout(command_buffer.handle(), vk::ImageLayout::GENERAL)?;
-            command_buffer.end()?;
+            command_buffer.encode(|buf| {
+                image.cmd_set_layout(buf, vk::ImageLayout::GENERAL)?;
+                Ok(())
+            });
+
             self.queue
                 .submit_binary(command_buffer, &[], &[], &[])?
                 .wait()?;
