@@ -1,12 +1,15 @@
 mod acceleration_structure;
 mod buffer;
 mod command_buffer;
+mod image;
 mod queue;
 mod shaders;
+mod swapchain;
 
 use acceleration_structure::AccelerationStructure;
 use buffer::Buffer;
 use command_buffer::CommandBuffer;
+use image::Image;
 use queue::Queue;
 use shaders::Shaders;
 
@@ -29,12 +32,8 @@ use bytemuck::{Pod, Zeroable};
 use anyhow::{bail, Context, Result};
 
 use ash::{
-    extensions::ext::DebugUtils,
-    extensions::khr::AccelerationStructure as AccelerationStructureLoader,
-    extensions::khr::DeferredHostOperations,
-    extensions::khr::RayTracingPipeline,
-    extensions::khr::Surface,
-    extensions::khr::Swapchain,
+    extensions::ext,
+    extensions::khr,
     version::{DeviceV1_0, DeviceV1_2, EntryV1_0, InstanceV1_0, InstanceV1_1, InstanceV1_2},
 };
 use ash::{vk, Device, Entry, Instance};
@@ -46,7 +45,10 @@ use vk::{
 };
 use vk_mem::{AllocatorCreateFlags, MemoryUsage};
 
-use self::queue::{Fence, TimelineSemaphore};
+use self::{
+    queue::{Fence, TimelineSemaphore},
+    swapchain::Swapchain,
+};
 
 const VERTICES: [f32; 9] = [0.25, 0.25, 0.0, 0.75, 0.25, 0.0, 0.50, 0.75, 0.0];
 const INDICES: [u32; 3] = [0, 1, 2];
@@ -111,9 +113,9 @@ pub struct Engine {
     vertices_buffer: Buffer,
     indices_buffer: Buffer,
     transform_buffer: Buffer,
-    ray_tracing_pipeline_loader: RayTracingPipeline,
+    ray_tracing_pipeline_loader: khr::RayTracingPipeline,
     ray_tracing_pipeline: vk::Pipeline,
-    acceleration_structure_loader: AccelerationStructureLoader,
+    acceleration_structure_loader: khr::AccelerationStructure,
     command_pool: vk::CommandPool,
     queue: Queue,
     ray_gen_sbt_buffer: Option<Buffer>,
@@ -124,12 +126,10 @@ pub struct Engine {
     descriptor_set: Option<vk::DescriptorSet>,
     allocation_keeper: Vec<Allocation>,
     pipeline_layout: Option<vk::PipelineLayout>,
-    swapchain_loader: Swapchain,
-    swapchain: vk::SwapchainKHR,
-    storage_image: Option<vk::Image>,
-    storage_image_view: Option<vk::ImageView>,
+    swapchain_loader: khr::Swapchain,
+    swapchain: Swapchain,
+    storage_image: Option<Image>,
     image_layout_keeper: BTreeMap<vk::Image, vk::ImageLayout>,
-    present_images: Vec<vk::Image>,
     ray_tracing_pipeline_properties: vk::PhysicalDeviceRayTracingPipelinePropertiesKHR,
     render_finish_semaphore: vk::Semaphore,
     render_finish_fence: Arc<Box<Fence>>,
@@ -169,7 +169,7 @@ impl Engine {
                 .iter()
                 .map(|ext| ext.as_ptr())
                 .collect::<Vec<_>>();
-            extension_names_raw.push(DebugUtils::name().as_ptr());
+            extension_names_raw.push(ext::DebugUtils::name().as_ptr());
 
             let appinfo = vk::ApplicationInfo::builder()
                 .application_name(&app_name)
@@ -196,7 +196,7 @@ impl Engine {
                 .message_type(vk::DebugUtilsMessageTypeFlagsEXT::all())
                 .pfn_user_callback(Some(vulkan_debug_callback));
 
-            let debug_utils_loader = DebugUtils::new(&entry, &instance);
+            let debug_utils_loader = ext::DebugUtils::new(&entry, &instance);
             let debug_call_back = debug_utils_loader
                 .create_debug_utils_messenger(&debug_info, None)
                 .unwrap();
@@ -204,7 +204,7 @@ impl Engine {
             let pdevices = instance
                 .enumerate_physical_devices()
                 .expect("Physical device error");
-            let surface_loader = Surface::new(&entry, &instance);
+            let surface_loader = khr::Surface::new(&entry, &instance);
             let (pdevice, queue_family_index) = pdevices
                 .iter()
                 .map(|pdevice| {
@@ -240,10 +240,10 @@ impl Engine {
 
             let queue_family_index = queue_family_index as u32;
             let device_extension_names_raw = [
-                Swapchain::name().as_ptr(),
-                AccelerationStructureLoader::name().as_ptr(),
-                RayTracingPipeline::name().as_ptr(),
-                DeferredHostOperations::name().as_ptr(),
+                khr::Swapchain::name().as_ptr(),
+                khr::AccelerationStructure::name().as_ptr(),
+                khr::RayTracingPipeline::name().as_ptr(),
+                khr::DeferredHostOperations::name().as_ptr(),
                 CStr::from_bytes_with_nul(b"VK_KHR_buffer_device_address\0")?.as_ptr(),
                 CStr::from_bytes_with_nul(b"VK_EXT_descriptor_indexing\0")?.as_ptr(),
                 CStr::from_bytes_with_nul(b"VK_KHR_spirv_1_4\0")?.as_ptr(),
@@ -289,60 +289,15 @@ impl Engine {
 
             let queue = Queue::new(&device, queue_family_index as u32, 0)?;
 
-            let surface_format = surface_loader
-                .get_physical_device_surface_formats(pdevice, surface)
-                .unwrap()[0];
+            let swapchain_loader = khr::Swapchain::new(&instance, &device);
 
-            let surface_capabilities =
-                surface_loader.get_physical_device_surface_capabilities(pdevice, surface)?;
-            let mut desired_image_count = surface_capabilities.min_image_count + 1;
-            if surface_capabilities.max_image_count > 0
-                && desired_image_count > surface_capabilities.max_image_count
-            {
-                desired_image_count = surface_capabilities.max_image_count;
-            }
-            let surface_resolution = match surface_capabilities.current_extent.width {
-                std::u32::MAX => vk::Extent2D {
-                    width: size.width,
-                    height: size.height,
-                },
-                _ => surface_capabilities.current_extent,
-            };
-            let pre_transform = if surface_capabilities
-                .supported_transforms
-                .contains(vk::SurfaceTransformFlagsKHR::IDENTITY)
-            {
-                vk::SurfaceTransformFlagsKHR::IDENTITY
-            } else {
-                surface_capabilities.current_transform
-            };
-            let present_modes =
-                surface_loader.get_physical_device_surface_present_modes(pdevice, surface)?;
-            let present_mode = present_modes
-                .iter()
-                .cloned()
-                .find(|&mode| mode == vk::PresentModeKHR::MAILBOX)
-                .unwrap_or(vk::PresentModeKHR::FIFO);
-            let present_mode = vk::PresentModeKHR::FIFO;
-            let swapchain_loader = Swapchain::new(&instance, &device);
-
-            let swapchain_create_info = vk::SwapchainCreateInfoKHR::builder()
-                .surface(surface)
-                .min_image_count(2)
-                .image_color_space(surface_format.color_space)
-                .image_format(surface_format.format)
-                .image_extent(surface_resolution)
-                .image_usage(
-                    vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::TRANSFER_DST,
-                )
-                .image_sharing_mode(vk::SharingMode::EXCLUSIVE)
-                .pre_transform(pre_transform)
-                .composite_alpha(vk::CompositeAlphaFlagsKHR::OPAQUE)
-                .present_mode(present_mode)
-                .clipped(true)
-                .image_array_layers(1);
-
-            let swapchain = swapchain_loader.create_swapchain(&swapchain_create_info, None)?;
+            let swapchain = Swapchain::new(
+                &swapchain_loader,
+                &surface_loader,
+                &surface,
+                &pdevice,
+                &device,
+            )?;
 
             let pool_create_info = vk::CommandPoolCreateInfo::builder()
                 .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER)
@@ -359,39 +314,12 @@ impl Engine {
             let setup_command_buffer = command_buffers[0];
             let draw_command_buffer = command_buffers[1];
 
-            let present_images = swapchain_loader.get_swapchain_images(swapchain).unwrap();
-            let present_image_views: Vec<vk::ImageView> = present_images
-                .iter()
-                .map(|&image| {
-                    let create_view_info = vk::ImageViewCreateInfo::builder()
-                        .view_type(vk::ImageViewType::TYPE_2D)
-                        .format(surface_format.format)
-                        .components(vk::ComponentMapping {
-                            r: vk::ComponentSwizzle::R,
-                            g: vk::ComponentSwizzle::G,
-                            b: vk::ComponentSwizzle::B,
-                            a: vk::ComponentSwizzle::A,
-                        })
-                        .subresource_range(vk::ImageSubresourceRange {
-                            aspect_mask: vk::ImageAspectFlags::COLOR,
-                            base_mip_level: 0,
-                            level_count: 1,
-                            base_array_layer: 0,
-                            layer_count: 1,
-                        })
-                        .image(image);
-                    device.create_image_view(&create_view_info, None).unwrap()
-                })
-                .collect();
             let mut image_layout_keeper = BTreeMap::new();
-            present_images.iter().for_each(|image| {
-                image_layout_keeper.insert(*image, vk::ImageLayout::UNDEFINED);
-            });
+
             let device_memory_properties = instance.get_physical_device_memory_properties(pdevice);
 
-            let ray_tracing_pipeline = RayTracingPipeline::new(&instance, &device);
-            let acceleration_structure_loader =
-                AccelerationStructureLoader::new(&instance, &device);
+            let ray_tracing_pipeline = khr::RayTracingPipeline::new(&instance, &device);
+            let acceleration_structure_loader = khr::AccelerationStructure::new(&instance, &device);
             let mut allocator = vk_mem::Allocator::new(&vk_mem::AllocatorCreateInfo {
                 physical_device: pdevice.clone(),
                 device: device.clone(),
@@ -424,7 +352,6 @@ impl Engine {
                 vk_mem::MemoryUsage::CpuToGpu,
                 allocator.clone(),
             )?;
-            dbg!(&vertices_buffer.size());
             vertices_buffer.copy_into(std::mem::transmute(&VERTICES))?;
 
             let indices_buffer = Buffer::new(
@@ -459,7 +386,6 @@ impl Engine {
                     .push_next(&mut ray_tracing_pipeline_properties)
                     .build(),
             );
-            dbg!(&ray_tracing_pipeline_properties);
 
             Ok(Self {
                 ray_tracing_pipeline_properties,
@@ -488,9 +414,7 @@ impl Engine {
                 swapchain,
                 top_as: None,
                 storage_image: None,
-                storage_image_view: None,
                 image_layout_keeper,
-                present_images,
                 render_finish_semaphore,
                 image_available_semaphore,
                 render_finish_fence,
@@ -545,52 +469,24 @@ impl Engine {
                     .build(),
                 &vk_mem::AllocationCreateInfo::default(),
             )?;
-            self.image_layout_keeper
-                .insert(image, vk::ImageLayout::UNDEFINED);
-            self.allocation_keeper.push(Allocation {
-                object: VulkanObject::Image(image),
-                allocation,
-            });
-            self.storage_image_view = Some(
-                self.device.create_image_view(
-                    &vk::ImageViewCreateInfo::builder()
-                        .view_type(vk::ImageViewType::TYPE_2D)
-                        .format(vk::Format::B8G8R8A8_UNORM)
-                        .subresource_range(
-                            vk::ImageSubresourceRange::builder()
-                                .aspect_mask(vk::ImageAspectFlags::COLOR)
-                                .base_mip_level(0)
-                                .level_count(1)
-                                .base_array_layer(0)
-                                .layer_count(1)
-                                .build(),
-                        )
-                        .image(image)
-                        .build(),
-                    None,
-                )?,
-            );
 
-            let fence = self
-                .device
-                .create_fence(&vk::FenceCreateInfo::default(), None)?;
+            let mut image = Image::new(
+                800,
+                600,
+                vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::STORAGE,
+                MemoryUsage::GpuOnly,
+                vk::ImageLayout::UNDEFINED,
+                &self.allocator,
+                &self.device,
+            )?;
 
             let command_buffer = CommandBuffer::new(&self.device, self.command_pool)?;
-
-            self.device.begin_command_buffer(
-                command_buffer.handle(),
-                &vk::CommandBufferBeginInfo::builder().build(),
-            );
-            self.cmd_set_image_layout(command_buffer.handle(), image, vk::ImageLayout::GENERAL)?;
-            self.device.end_command_buffer(command_buffer.handle());
-            self.device.queue_submit(
-                self.queue.handle(),
-                &[vk::SubmitInfo::builder()
-                    .command_buffers(&[command_buffer.handle()])
-                    .build()],
-                fence,
-            )?;
-            self.device.wait_for_fences(&[fence], true, std::u64::MAX)?;
+            command_buffer.begin()?;
+            image.cmd_set_layout(command_buffer.handle(), vk::ImageLayout::GENERAL)?;
+            command_buffer.end()?;
+            self.queue
+                .submit_binary(command_buffer, &[], &[], &[])?
+                .wait()?;
 
             self.storage_image = Some(image);
         }
@@ -641,7 +537,7 @@ impl Engine {
                         .dst_binding(1)
                         .dst_set(self.descriptor_set.unwrap())
                         .image_info(&[vk::DescriptorImageInfo::builder()
-                            .image_view(self.storage_image_view.unwrap())
+                            .image_view(self.storage_image.as_ref().unwrap().view())
                             .image_layout(vk::ImageLayout::GENERAL)
                             .build()])
                         .build(),
@@ -958,12 +854,9 @@ impl Engine {
 
     pub fn render(&mut self) -> Result<()> {
         unsafe {
-            let (index, _) = self.swapchain_loader.acquire_next_image(
-                self.swapchain,
-                0,
-                self.image_available_semaphore,
-                vk::Fence::null(),
-            )?;
+            let (index, _) = self
+                .swapchain
+                .acquire_next_image(self.image_available_semaphore)?;
             let handle_size_aligned = self
                 .ray_tracing_pipeline_properties
                 .shader_group_handle_alignment as u64;
@@ -1011,22 +904,21 @@ impl Engine {
                 600,
                 1,
             );
-            self.cmd_set_image_layout(
+            self.storage_image.as_mut().unwrap().cmd_set_layout(
                 command_buffer.handle(),
-                self.storage_image.unwrap(),
                 vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-            )?;
-            self.cmd_set_image_layout(
+            );
+
+            self.swapchain.images()[index as usize].cmd_set_layout(
                 command_buffer.handle(),
-                self.present_images[index as usize],
                 vk::ImageLayout::TRANSFER_DST_OPTIMAL,
             )?;
 
             self.device.cmd_copy_image(
                 command_buffer.handle(),
-                self.storage_image.unwrap(),
+                self.storage_image.as_ref().unwrap().handle(),
                 vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-                self.present_images[index as usize],
+                self.swapchain.images()[index as usize].handle(),
                 vk::ImageLayout::TRANSFER_DST_OPTIMAL,
                 &[vk::ImageCopy::builder()
                     .src_subresource(
@@ -1052,16 +944,13 @@ impl Engine {
                     })
                     .build()],
             );
-            self.cmd_set_image_layout(
-                command_buffer.handle(),
-                self.present_images[index as usize],
-                vk::ImageLayout::PRESENT_SRC_KHR,
-            )?;
-            self.cmd_set_image_layout(
-                command_buffer.handle(),
-                self.storage_image.unwrap(),
-                vk::ImageLayout::GENERAL,
-            )?;
+
+            self.swapchain.images()[index as usize]
+                .cmd_set_layout(command_buffer.handle(), vk::ImageLayout::PRESENT_SRC_KHR)?;
+            self.storage_image
+                .as_mut()
+                .unwrap()
+                .cmd_set_layout(command_buffer.handle(), vk::ImageLayout::GENERAL);
             self.device.end_command_buffer(command_buffer.handle())?;
 
             debug!("record complete");
@@ -1079,77 +968,13 @@ impl Engine {
             self.swapchain_loader.queue_present(
                 self.queue.handle(),
                 &vk::PresentInfoKHR::builder()
-                    .swapchains(&[self.swapchain])
+                    .swapchains(&[self.swapchain.handle()])
                     .image_indices(&[index])
                     .wait_semaphores(&[self.render_finish_semaphore])
                     .build(),
             )?;
 
             info!("frame presented");
-        }
-        Ok(())
-    }
-
-    fn cmd_set_image_layout(
-        &mut self,
-        command_buffer: vk::CommandBuffer,
-        image: vk::Image,
-        new_layout: vk::ImageLayout,
-    ) -> Result<()> {
-        use vk::AccessFlags;
-        use vk::ImageLayout;
-        use vk::PipelineStageFlags;
-        unsafe {
-            let old_layout = *self.image_layout_keeper.get(&image).unwrap();
-
-            let src_access_mask = match old_layout {
-                ImageLayout::UNDEFINED => AccessFlags::default(),
-                ImageLayout::GENERAL => AccessFlags::default(),
-                ImageLayout::COLOR_ATTACHMENT_OPTIMAL => AccessFlags::COLOR_ATTACHMENT_WRITE,
-                ImageLayout::TRANSFER_DST_OPTIMAL => AccessFlags::TRANSFER_WRITE,
-                ImageLayout::TRANSFER_SRC_OPTIMAL => AccessFlags::TRANSFER_READ,
-                ImageLayout::PRESENT_SRC_KHR => AccessFlags::COLOR_ATTACHMENT_READ,
-                _ => {
-                    bail!("unknown old layout {:?}", old_layout);
-                }
-            };
-            let dst_access_mask = match new_layout {
-                ImageLayout::COLOR_ATTACHMENT_OPTIMAL => AccessFlags::COLOR_ATTACHMENT_WRITE,
-                ImageLayout::GENERAL => AccessFlags::default(),
-                ImageLayout::TRANSFER_SRC_OPTIMAL => AccessFlags::TRANSFER_READ,
-                ImageLayout::TRANSFER_DST_OPTIMAL => AccessFlags::TRANSFER_WRITE,
-                ImageLayout::PRESENT_SRC_KHR => AccessFlags::COLOR_ATTACHMENT_READ,
-                _ => {
-                    bail!("unknown new layout {:?}", new_layout);
-                }
-            };
-            self.device.cmd_pipeline_barrier(
-                command_buffer,
-                vk::PipelineStageFlags::ALL_COMMANDS,
-                vk::PipelineStageFlags::ALL_COMMANDS,
-                vk::DependencyFlags::empty(),
-                &[],
-                &[],
-                &[vk::ImageMemoryBarrier::builder()
-                    .image(image)
-                    .old_layout(old_layout)
-                    .new_layout(new_layout)
-                    .src_access_mask(src_access_mask)
-                    .dst_access_mask(dst_access_mask)
-                    .subresource_range(
-                        vk::ImageSubresourceRange::builder()
-                            .aspect_mask(vk::ImageAspectFlags::COLOR)
-                            .base_mip_level(0)
-                            .level_count(1)
-                            .base_array_layer(0)
-                            .layer_count(1)
-                            .build(),
-                    )
-                    .build()],
-            );
-            if let None = self.image_layout_keeper.insert(image, new_layout) {
-                bail!("fuck");
-            }
         }
         Ok(())
     }

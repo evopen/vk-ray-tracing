@@ -194,11 +194,8 @@ impl Queue {
 
             let device = self.device.clone();
             tokio::task::spawn(async move {
-                debug!("waiting");
                 fence.wait().unwrap();
-
                 drop(command_buffer);
-                debug!("freed");
             });
             Ok(())
         }
@@ -212,7 +209,6 @@ impl Queue {
         signal_semaphores: &[vk::Semaphore],
     ) -> Result<Arc<Box<Fence>>> {
         unsafe {
-            debug!("submitted");
             let fence = Arc::new(Box::new(Fence::new(&self.device, false)?));
 
             let mut submit_info = vk::SubmitInfo::builder()
@@ -224,17 +220,14 @@ impl Queue {
 
             self.device
                 .queue_submit(self.handle, &[submit_info], fence.handle)?;
-            debug!("submitted to device");
             let device = self.device.clone();
             let handle = fence.handle;
             let cmd_buffer_freer = fence.clone();
             tokio::task::spawn(async move {
-                debug!("waiting");
                 device
                     .wait_for_fences(&[cmd_buffer_freer.handle()], true, std::u64::MAX)
                     .unwrap();
                 drop(command_buffer);
-                debug!("freed");
             });
 
             Ok(fence)
