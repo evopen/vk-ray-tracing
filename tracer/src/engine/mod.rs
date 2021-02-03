@@ -114,7 +114,6 @@ pub struct Engine {
     ray_tracing_pipeline_loader: RayTracingPipeline,
     ray_tracing_pipeline: vk::Pipeline,
     acceleration_structure_loader: AccelerationStructureLoader,
-    top_as: Option<vk::AccelerationStructureKHR>,
     command_pool: vk::CommandPool,
     queue: Queue,
     ray_gen_sbt_buffer: Option<Buffer>,
@@ -125,7 +124,6 @@ pub struct Engine {
     descriptor_set: Option<vk::DescriptorSet>,
     allocation_keeper: Vec<Allocation>,
     pipeline_layout: Option<vk::PipelineLayout>,
-    top_as_buffer: Option<Buffer>,
     swapchain_loader: Swapchain,
     swapchain: vk::SwapchainKHR,
     storage_image: Option<vk::Image>,
@@ -137,6 +135,7 @@ pub struct Engine {
     image_available_semaphore: vk::Semaphore,
     instance_buffer: Option<Buffer>,
     bottom_as: Option<AccelerationStructure>,
+    top_as: Option<AccelerationStructure>,
     allocator: vk_mem::Allocator,
 }
 
@@ -468,7 +467,6 @@ impl Engine {
                 descriptor_set: None,
                 allocation_keeper,
                 pipeline_layout: None,
-                top_as_buffer: None,
                 swapchain_loader,
                 swapchain,
                 top_as: None,
@@ -596,17 +594,7 @@ impl Engine {
                     .to_owned(),
             );
             debug!("descriptor set allocated");
-            let mut as_descirptor_write = vk::WriteDescriptorSet::builder()
-                .descriptor_type(vk::DescriptorType::ACCELERATION_STRUCTURE_KHR)
-                .dst_binding(0)
-                .dst_set(self.descriptor_set.unwrap())
-                .push_next(
-                    &mut vk::WriteDescriptorSetAccelerationStructureKHR::builder()
-                        .acceleration_structures(&[self.top_as.unwrap()])
-                        .build(),
-                )
-                .build();
-            as_descirptor_write.descriptor_count = 1;
+
             self.device.update_descriptor_sets(
                 &[
                     std::iter::once(
@@ -616,7 +604,11 @@ impl Engine {
                             .dst_set(self.descriptor_set.unwrap())
                             .push_next(
                                 &mut vk::WriteDescriptorSetAccelerationStructureKHR::builder()
-                                    .acceleration_structures(&[self.top_as.unwrap()])
+                                    .acceleration_structures(&[self
+                                        .top_as
+                                        .as_ref()
+                                        .unwrap()
+                                        .handle()])
                                     .build(),
                             )
                             .build(),
@@ -688,7 +680,7 @@ impl Engine {
             let instance = vk::AccelerationStructureInstanceKHR {
                 transform: vk::TransformMatrixKHR { matrix: TRANSFORM },
                 instance_custom_index_and_mask: 0xFF,
-                instance_shader_binding_table_record_offset_and_flags: 0,
+                instance_shader_binding_table_record_offset_and_flags: 0x01,
                 acceleration_structure_reference: vk::AccelerationStructureReferenceKHR {
                     device_handle: self
                         .acceleration_structure_loader
@@ -713,43 +705,32 @@ impl Engine {
             let raw = std::mem::transmute(&instance);
             std::ptr::copy_nonoverlapping(raw, mapped, std::mem::size_of_val(&instance));
 
+            instance_buffer.unmap();
+
             let geometry = vk::AccelerationStructureGeometryKHR::builder()
                 .geometry_type(vk::GeometryTypeKHR::INSTANCES)
+                .flags(vk::GeometryFlagsKHR::OPAQUE)
                 .geometry(vk::AccelerationStructureGeometryDataKHR {
                     instances: vk::AccelerationStructureGeometryInstancesDataKHR::builder()
                         .array_of_pointers(false)
                         .data(vk::DeviceOrHostAddressConstKHR {
-                            device_address: self.get_buffer_device_address(instance_buffer.handle),
+                            device_address: instance_buffer.device_address()?,
                         })
                         .build(),
                 })
                 .build();
-            let as_build_size = self
-                .acceleration_structure_loader
-                .get_acceleration_structure_build_sizes(
-                    self.device.handle(),
-                    vk::AccelerationStructureBuildTypeKHR::DEVICE,
-                    &vk::AccelerationStructureBuildGeometryInfoKHR::builder()
-                        .ty(vk::AccelerationStructureTypeKHR::TOP_LEVEL)
-                        .geometries(&[geometry]),
-                    &[1],
-                );
-            let buffer = self.create_acceleration_structure_buffer(as_build_size)?;
 
-            let top_as = self
-                .acceleration_structure_loader
-                .create_acceleration_structure(
-                    &vk::AccelerationStructureCreateInfoKHR::builder()
-                        .buffer(buffer.handle)
-                        .size(as_build_size.acceleration_structure_size)
-                        .ty(vk::AccelerationStructureTypeKHR::TOP_LEVEL)
-                        .build(),
-                    None,
-                )?;
-            dbg!(&as_build_size.acceleration_structure_size);
+            let top_as = AccelerationStructure::new(
+                &self.device,
+                self.command_pool,
+                &self.queue,
+                &self.acceleration_structure_loader,
+                &self.allocator,
+                &[geometry],
+                vk::AccelerationStructureTypeKHR::TOP_LEVEL,
+            )?;
+
             self.top_as = Some(top_as);
-            self.top_as_buffer = Some(buffer);
-            self.instance_buffer = Some(instance_buffer);
         }
         Ok(())
     }

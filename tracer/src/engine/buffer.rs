@@ -68,8 +68,10 @@ impl Buffer {
         self.allocator.unmap_memory(&self.allocation)
     }
 
-    pub fn device_address(&self) -> vk::DeviceAddress {
-        self.device_address.unwrap()
+    pub fn device_address(&self) -> Result<vk::DeviceAddress> {
+        Ok(self
+            .device_address
+            .context("buffer does not support device addressing")?)
     }
 }
 

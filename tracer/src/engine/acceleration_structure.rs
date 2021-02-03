@@ -61,8 +61,10 @@ impl AccelerationStructure {
                 .dst_acceleration_structure(handle)
                 .mode(vk::BuildAccelerationStructureModeKHR::BUILD)
                 .scratch_data(vk::DeviceOrHostAddressKHR {
-                    device_address: scratch_buffer.device_address(),
+                    device_address: scratch_buffer.device_address()?,
                 });
+
+            dbg!(&build_geometry_info.clone());
 
             let build_range_info = vk::AccelerationStructureBuildRangeInfoKHR::builder()
                 .primitive_count(1)
